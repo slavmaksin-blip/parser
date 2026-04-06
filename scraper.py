@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import urlparse, urlunparse, urlencode, parse_qs, urljoin
+from urllib.parse import urlparse, urljoin
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -24,7 +25,6 @@ HEADERS = {
 }
 
 # ─── Category definitions ────────────────────────────────────────────────────
-# key → (Russian name, base URL)
 CATEGORIES: dict[str, str] = {
     "hats":              "Шляпы, шапки, кепки (женские)",
     "shoes_men":         "Мужская обувь",
@@ -47,8 +47,19 @@ CATEGORY_URLS: dict[str, str] = {
     "accessories_women": "https://www.ricardo.ch/de/c/accessoires-fuer-damen-40749/",
 }
 
-# Number of pages to scan per category per monitoring run
-PAGES_PER_CATEGORY = 2
+# ─── Random-probe constants ───────────────────────────────────────────────────
+# IDs observed in the problem statement: 1307375512, 1313109388 (~1.3 billion range)
+LISTING_ID_MIN = 1_300_000_000
+LISTING_ID_MAX = 1_350_000_000
+LISTING_PROBE_COUNT = 60          # random IDs to probe per monitoring run
+LISTING_PROBE_CONCURRENCY = 10    # max simultaneous HTTP requests
+
+# German month abbreviations used on Ricardo.ch ("8. Apr. 2026, 17:45 Uhr")
+_DE_MONTHS: dict[str, int] = {
+    "jan": 1, "feb": 2, "mär": 3, "mrz": 3, "mar": 3,
+    "apr": 4, "mai": 5, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "okt": 10, "nov": 11, "dez": 12,
+}
 
 
 @dataclass
@@ -192,6 +203,41 @@ def _parse_relative_date(text: str) -> Optional[datetime]:
     return None
 
 
+def _parse_german_datetime(text: str) -> Optional[datetime]:
+    """Parse Ricardo.ch listing date format: '8. Apr. 2026, 17:45 Uhr'."""
+    text = text.strip()
+    # Primary pattern with time: "8. Apr. 2026, 17:45 Uhr"
+    m = re.search(
+        r"(\d{1,2})\.\s+(\w+\.?)\s+(\d{4})[,\s]+(\d{1,2}):(\d{2})",
+        text, re.I,
+    )
+    if m:
+        day = int(m.group(1))
+        month_str = m.group(2).lower().rstrip(".")
+        year = int(m.group(3))
+        hour = int(m.group(4))
+        minute = int(m.group(5))
+        month = _DE_MONTHS.get(month_str[:3])
+        if month:
+            try:
+                return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    # Date only: "8. Apr. 2026"
+    m = re.search(r"(\d{1,2})\.\s+(\w+\.?)\s+(\d{4})", text, re.I)
+    if m:
+        day = int(m.group(1))
+        month_str = m.group(2).lower().rstrip(".")
+        year = int(m.group(3))
+        month = _DE_MONTHS.get(month_str[:3])
+        if month:
+            try:
+                return datetime(year, month, day, tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    return None
+
+
 def _add_page_param(base_url: str, page: int) -> str:
     """Append page=N to a category URL, handling existing query strings."""
     if page <= 1:
@@ -200,7 +246,6 @@ def _add_page_param(base_url: str, page: int) -> str:
     qs = parsed.query
     if qs:
         return base_url + f"&page={page}"
-    # URL ends with '/' – use '?page=N'
     return base_url.rstrip("/") + f"/?page={page}"
 
 
@@ -231,9 +276,15 @@ async def fetch_seller_info(
         for tag in soup.find_all(string=re.compile(r"Mitglied seit|member since", re.I)):
             parent = tag.parent
             text = parent.get_text(" ", strip=True)
+            # Full date: "15.01.2018"
             m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", text)
             if m:
                 reg_date = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)), tzinfo=timezone.utc)
+                break
+            # Year only: "Mitglied seit 2018"
+            m = re.search(r"\b(20\d{2}|19\d{2})\b", text)
+            if m:
+                reg_date = datetime(int(m.group(1)), 1, 1, tzinfo=timezone.utc)
                 break
 
         # Sold count: look for patterns like "123 Bewertungen als Verkäufer" / "Verkäufe"
@@ -274,175 +325,177 @@ async def fetch_seller_info(
     return None, None, None
 
 
+# ─── Listing detail page ────────────────────────────────────────────────────
+
+async def fetch_listing_detail(
+    session: aiohttp.ClientSession, listing_id: str
+) -> Optional["Listing"]:
+    """Fetch a single listing page by ID and return a Listing if it has SOFORT KAUFEN."""
+    url = f"https://www.ricardo.ch/de/a/{listing_id}/"
+    try:
+        async with session.get(
+            url,
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=12),
+            allow_redirects=True,
+        ) as resp:
+            if resp.status != 200:
+                return None
+            # If redirect took us away from the article path, it's a dead ID
+            if "/a/" not in str(resp.url):
+                return None
+            html = await resp.text()
+    except Exception as exc:
+        logger.debug("fetch_listing_detail(%s) error: %s", listing_id, exc)
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # ── Must have a "SOFORT KAUFEN" button ────────────────────────────────
+    sofort_btn = soup.find(
+        string=re.compile(r"sofort\s*kaufen", re.I)
+    ) or soup.find(
+        attrs={"data-testid": re.compile(r"buy.now|sofort", re.I)}
+    )
+    if not sofort_btn:
+        return None
+
+    # ── Title ─────────────────────────────────────────────────────────────
+    title: Optional[str] = None
+    for candidate in [
+        soup.find("h1"),
+        soup.find(attrs={"data-testid": re.compile(r"title|name", re.I)}),
+        soup.find(class_=re.compile(r"title|heading|product.name", re.I)),
+    ]:
+        if candidate:
+            t = candidate.get_text(strip=True)
+            if t:
+                title = t
+                break
+    if not title:
+        return None
+
+    # ── Publication date ──────────────────────────────────────────────────
+    # Ricardo shows "8. Apr. 2026, 17:45 Uhr" near the top of the page
+    posted_at: Optional[datetime] = None
+    for text_node in soup.find_all(string=re.compile(r"\d{1,2}\.\s+\w+\s+\d{4}", re.I)):
+        dt = _parse_german_datetime(str(text_node))
+        if dt:
+            posted_at = dt
+            break
+    if not posted_at:
+        for time_tag in soup.find_all("time"):
+            dt_attr = time_tag.get("datetime", "")
+            if dt_attr:
+                try:
+                    posted_at = datetime.fromisoformat(dt_attr.replace("Z", "+00:00"))
+                    break
+                except ValueError:
+                    pass
+
+    # ── Price (Sofort-Kaufpreis) ───────────────────────────────────────────
+    price: Optional[float] = None
+    price_label = soup.find(string=re.compile(r"Sofort.Kaufpreis|sofortkaufpreis", re.I))
+    if price_label:
+        # price is usually in the next sibling element or a close parent
+        container = price_label.find_parent()
+        if container:
+            for sibling in list(container.next_siblings) + [container.parent]:
+                if sibling and hasattr(sibling, "get_text"):
+                    p = _parse_price(sibling.get_text(" ", strip=True))
+                    if p:
+                        price = p
+                        break
+    if price is None:
+        for tag in soup.find_all(class_=re.compile(r"price|preis", re.I)):
+            p = _parse_price(tag.get_text())
+            if p:
+                price = p
+                break
+
+    # ── Seller username from "Verkäufer" section ──────────────────────────
+    seller_name = ""
+    seller_url = ""
+
+    # First try: find "Verkäufer" label and look for a shop link nearby
+    vk_label = soup.find(string=re.compile(r"Verk[äa]ufer", re.I))
+    if vk_label:
+        container = vk_label.find_parent()
+        search_root = container.parent if container else soup
+        if search_root:
+            shop_link = search_root.find("a", href=re.compile(r"/de/shop/"))
+            if shop_link:
+                m = re.search(r"/de/shop/([^/]+)/", shop_link.get("href", ""))
+                if m:
+                    seller_name = m.group(1)
+
+    # Fallback: any shop link on the page
+    if not seller_name:
+        for link in soup.find_all("a", href=re.compile(r"/de/shop/")):
+            m = re.search(r"/de/shop/([^/]+)/", link.get("href", ""))
+            if m:
+                seller_name = m.group(1)
+                break
+
+    if seller_name:
+        seller_url = f"https://www.ricardo.ch/de/shop/{seller_name}/ratings/"
+
+    # ── Image ─────────────────────────────────────────────────────────────
+    image_url = ""
+    img = soup.find("img", src=re.compile(r"ricardo|cdn", re.I))
+    if not img:
+        img = soup.find("img")
+    if img:
+        image_url = img.get("src") or img.get("data-src") or ""
+
+    return Listing(
+        listing_id=listing_id,
+        title=title,
+        price=price,
+        url=url,
+        image_url=image_url,
+        posted_at=posted_at,
+        seller_name=seller_name,
+        seller_url=seller_url,
+    )
+
+
 # ─── Main scraper ─────────────────────────────────────────────────────────────
+
+async def probe_random_listings(
+    session: aiohttp.ClientSession,
+    n_probes: int = LISTING_PROBE_COUNT,
+) -> list[Listing]:
+    """Generate random 10-digit listing IDs and return those with SOFORT KAUFEN."""
+    ids = [
+        str(random.randint(LISTING_ID_MIN, LISTING_ID_MAX))
+        for _ in range(n_probes)
+    ]
+    semaphore = asyncio.Semaphore(LISTING_PROBE_CONCURRENCY)
+    results: list[Listing] = []
+
+    async def probe_one(lid: str) -> None:
+        async with semaphore:
+            listing = await fetch_listing_detail(session, lid)
+            if listing:
+                results.append(listing)
+            await asyncio.sleep(0.3)
+
+    await asyncio.gather(*[probe_one(lid) for lid in ids], return_exceptions=True)
+    return results
+
 
 async def fetch_listings(
     session: aiohttp.ClientSession,
     keywords: list[str],
     categories: list[str],
 ) -> list[Listing]:
-    """Fetch new listings from Ricardo.ch for given keywords and categories."""
-    results: list[Listing] = []
-    seen_ids: set[str] = set()
+    """Probe random Ricardo.ch listing IDs and return SOFORT KAUFEN listings.
 
-    # Determine which category keys to query
-    cat_keys: list[str]
-    if not categories:
-        cat_keys = list(CATEGORY_URLS.keys())
-    else:
-        cat_keys = [c for c in categories if c in CATEGORY_URLS]
-        if not cat_keys:
-            cat_keys = list(CATEGORY_URLS.keys())
-
-    for cat_key in cat_keys:
-        base_url = CATEGORY_URLS[cat_key]
-        cat_name = CATEGORIES[cat_key]
-
-        for page in range(1, PAGES_PER_CATEGORY + 1):
-            url = _add_page_param(base_url, page)
-
-            # Append keyword search param if provided
-            params: dict = {}
-            if keywords:
-                params["q"] = " ".join(keywords)
-
-            try:
-                async with session.get(
-                    url,
-                    params=params if params else None,
-                    headers=HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning("ricardo.ch returned %s for %s", resp.status, url)
-                        break
-                    html = await resp.text()
-            except Exception as exc:
-                logger.error("Error fetching %s: %s", url, exc)
-                break
-
-            page_listings = _parse_search_page(html, cat_name)
-            added = 0
-            for listing in page_listings:
-                if listing.listing_id not in seen_ids:
-                    seen_ids.add(listing.listing_id)
-                    results.append(listing)
-                    added += 1
-
-            # If no new listings on this page, stop paginating this category
-            if added == 0:
-                break
-
-            await asyncio.sleep(1)
-
-    return results
-
-
-def _parse_search_page(html: str, category_name: str = "") -> list[Listing]:
-    """Parse listing cards from the Ricardo search results HTML."""
-    soup = BeautifulSoup(html, "lxml")
-    listings: list[Listing] = []
-
-    # Ricardo renders article cards; selectors may need updating if the site changes.
-    # We try several common patterns.
-    cards = (
-        soup.select("article[data-testid]")
-        or soup.select("article.listing-card")
-        or soup.select("[data-testid='listing-card']")
-        or soup.select("li[class*='listing']")
-        or soup.select("div[class*='ArticleCard']")
-        or soup.select("a[href*='/a/']")  # fallback: any link to an article
-    )
-
-    for card in cards:
-        listing = _parse_card(card, category_name)
-        if listing:
-            listings.append(listing)
-
-    return listings
-
-
-def _parse_card(card, category_name: str) -> Optional[Listing]:
-    """Extract a single Listing from an HTML card element."""
-    try:
-        # ── URL & ID ───────────────────────────────────────────────────────
-        link = card if card.name == "a" else card.find("a", href=True)
-        if not link:
-            return None
-        href = link.get("href", "")
-        if not href:
-            return None
-        if not href.startswith("http"):
-            href = "https://www.ricardo.ch" + href
-
-        # Extract listing ID from URL patterns like /a/12345678/ or similar
-        id_match = re.search(r"/a/(\d+)/", href) or re.search(r"/(\d{6,})", href)
-        if not id_match:
-            return None
-        listing_id = id_match.group(1)
-
-        # ── Title ──────────────────────────────────────────────────────────
-        title_tag = (
-            card.find(attrs={"data-testid": re.compile(r"title", re.I)})
-            or card.find(["h2", "h3", "h4"])
-            or card.find(class_=re.compile(r"title|name", re.I))
-        )
-        title = title_tag.get_text(strip=True) if title_tag else link.get_text(strip=True)
-        if not title:
-            return None
-
-        # ── Price ──────────────────────────────────────────────────────────
-        price_tag = (
-            card.find(attrs={"data-testid": re.compile(r"price", re.I)})
-            or card.find(class_=re.compile(r"price|preis", re.I))
-        )
-        price = _parse_price(price_tag.get_text()) if price_tag else None
-
-        # ── Image ──────────────────────────────────────────────────────────
-        img_tag = card.find("img")
-        image_url = ""
-        if img_tag:
-            image_url = img_tag.get("src") or img_tag.get("data-src") or ""
-
-        # ── Posted date ────────────────────────────────────────────────────
-        date_tag = card.find(
-            attrs={"data-testid": re.compile(r"date|time", re.I)}
-        ) or card.find("time") or card.find(class_=re.compile(r"date|time|ago", re.I))
-        posted_at: Optional[datetime] = None
-        if date_tag:
-            dt_attr = date_tag.get("datetime")
-            if dt_attr:
-                try:
-                    posted_at = datetime.fromisoformat(dt_attr.replace("Z", "+00:00"))
-                except ValueError:
-                    pass
-            if not posted_at:
-                posted_at = _parse_relative_date(date_tag.get_text(strip=True))
-
-        # ── Seller ─────────────────────────────────────────────────────────
-        seller_tag = card.find(
-            attrs={"data-testid": re.compile(r"seller|vendor", re.I)}
-        ) or card.find(class_=re.compile(r"seller|vendor|user", re.I))
-        seller_name = seller_tag.get_text(strip=True) if seller_tag else ""
-        seller_href = seller_tag.get("href", "") if seller_tag and seller_tag.name == "a" else ""
-        if seller_href and not seller_href.startswith("http"):
-            from urllib.parse import urljoin
-            seller_href = urljoin("https://www.ricardo.ch", seller_href)
-
-        return Listing(
-            listing_id=listing_id,
-            title=title,
-            price=price,
-            url=href,
-            image_url=image_url,
-            category=category_name,
-            posted_at=posted_at,
-            seller_name=seller_name,
-            seller_url=seller_href,
-        )
-    except Exception as exc:
-        logger.debug("Error parsing card: %s", exc)
-        return None
+    keywords / categories are accepted for API compatibility but are not used
+    for navigation – filtering by these is handled in Listing.matches().
+    """
+    return await probe_random_listings(session, n_probes=LISTING_PROBE_COUNT)
 
 
 async def enrich_seller_info(
