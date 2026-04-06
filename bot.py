@@ -1,6 +1,5 @@
 """Telegram bot for monitoring Ricardo.ch new listings."""
 
-import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -479,8 +478,13 @@ async def _check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Bot setup ────────────────────────────────────────────────────────────────
 
+async def _post_init(app: Application) -> None:
+    """Initialize the database after the event loop is running."""
+    await db.init_db()
+
+
 def build_app() -> Application:
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     # Filter conversation
     conv = ConversationHandler(
@@ -508,12 +512,7 @@ def build_app() -> Application:
     return app
 
 
-async def main() -> None:
-    await db.init_db()
+if __name__ == "__main__":
     app = build_app()
     logger.info("Bot started")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
