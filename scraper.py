@@ -128,7 +128,7 @@ class Listing:
             else "Неизвестно"
         )
         reg_str = (
-            self.seller_registered.strftime("%d.%m.%Y %H:%M")
+            self.seller_registered.strftime("%d.%m.%Y")
             if self.seller_registered
             else "Неизвестно"
         )
@@ -426,7 +426,8 @@ def _parse_card(card, category_name: str) -> Optional[Listing]:
         seller_name = seller_tag.get_text(strip=True) if seller_tag else ""
         seller_href = seller_tag.get("href", "") if seller_tag and seller_tag.name == "a" else ""
         if seller_href and not seller_href.startswith("http"):
-            seller_href = "https://www.ricardo.ch" + seller_href
+            from urllib.parse import urljoin
+            seller_href = urljoin("https://www.ricardo.ch", seller_href)
 
         return Listing(
             listing_id=listing_id,

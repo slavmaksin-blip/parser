@@ -1,72 +1,77 @@
 # Ricardo.ch Telegram Monitor Bot
 
-A Telegram bot that monitors [ricardo.ch](https://www.ricardo.ch) for new listings and notifies you when they match your filters.
+Telegram-бот (на русском языке) для мониторинга новых объявлений на [ricardo.ch](https://www.ricardo.ch) с уведомлениями по заданным фильтрам.
 
-## Features
+## Функции
 
-- **Category filter** — choose one or more categories (Electronics, Fashion, Home & Garden, etc.)
-- **Keyword filter** — search for specific terms
-- **Price range** — set a minimum and/or maximum price in CHF
-- **Seller registration date** — only notify for sellers who registered before a given date (useful for filtering out new / potentially untrusted sellers)
-- **Listing age** — only notify for listings posted within the last N hours
-- Listings are checked every **30 minutes** automatically after `/monitor` is started
+- **Категории** — 8 предустановленных категорий Ricardo.ch (одежда, обувь, аксессуары и др.)
+- **Ключевые слова** — поиск по конкретным словам
+- **Диапазон цен** — минимальная и/или максимальная цена в CHF
+- **Дата регистрации продавца** — только продавцы, зарегистрированные до указанной даты
+- **Дата публикации товара (от / до)** — диапазон дат/времени публикации объявления
+- **Минимум продаж у продавца** — только продавцы с не менее X продажами
+- **Минимум покупок у продавца** — только продавцы с не менее X покупками
+- Проверка каждые **30 минут** после запуска `/monitor`
 
-## Requirements
+## Требования
 
 - Python 3.11+
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Токен Telegram-бота от [@BotFather](https://t.me/BotFather)
 
-## Setup
+## Установка
 
 ```bash
-# 1. Clone the repo and install dependencies
+# 1. Установить зависимости
 pip install -r requirements.txt
 
-# 2. Configure environment
+# 2. Настроить окружение
 cp .env.example .env
-# Edit .env and set TELEGRAM_BOT_TOKEN
+# Открыть .env и задать TELEGRAM_BOT_TOKEN
 
-# 3. Run the bot
+# 3. Запустить бота
 python bot.py
 ```
 
-## Bot Commands
+## Команды бота
 
-| Command | Description |
+| Команда | Описание |
 |---|---|
-| `/start` | Welcome message |
-| `/filter` | Open the interactive filter setup menu |
-| `/myfilters` | Show your current filters |
-| `/monitor` | Start receiving notifications |
-| `/stop` | Stop receiving notifications |
-| `/help` | Show help |
-| `/cancel` | Cancel the current operation |
+| `/start` | Приветственное сообщение |
+| `/filter` | Открыть меню настройки фильтров |
+| `/myfilters` | Показать текущие фильтры |
+| `/monitor` | Запустить мониторинг |
+| `/stop` | Остановить мониторинг |
+| `/help` | Показать справку |
+| `/cancel` | Отменить текущее действие |
 
-## Filter Options
+## Параметры фильтров
 
-| Filter | Description | Example |
+| Фильтр | Описание | Пример |
 |---|---|---|
-| Categories | Which Ricardo.ch categories to watch | Electronics, Fashion |
-| Keywords | Search terms (comma-separated) | `iPhone, MacBook` |
-| Min. Price | Minimum listing price in CHF | `50` |
-| Max. Price | Maximum listing price in CHF | `500` |
-| Max. Seller Reg. Date | Only sellers registered *before* this date | `2023-01-01` |
-| Max. Listing Age | Only listings posted within the last N hours | `24` |
+| Категории | Категории Ricardo.ch для отслеживания | Рюкзаки, Блузки и туники |
+| Ключевые слова | Поисковые слова (через запятую) | `сумка, шарф` |
+| Цена от | Минимальная цена в CHF | `50` |
+| Цена до | Максимальная цена в CHF | `500` |
+| Продавец зарегистрирован до | Только продавцы, зарег. до этой даты | `2023-01-01` |
+| Публикация от | Объявления, опубликованные после этой даты/времени | `2024-01-15 09:00` |
+| Публикация до | Объявления, опубликованные до этой даты/времени | `2024-12-31 23:59` |
+| Продано мин. | Минимальное кол-во продаж у продавца | `10` |
+| Покупок мин. | Минимальное кол-во покупок у продавца | `5` |
 
-## Project Structure
+## Структура проекта
 
 ```
 parser/
-├── bot.py          # Telegram bot (entry point)
-├── scraper.py      # Ricardo.ch async scraper
-├── db.py           # SQLite database (aiosqlite)
+├── bot.py          # Telegram-бот (точка входа)
+├── scraper.py      # Асинхронный парсер Ricardo.ch
+├── db.py           # База данных SQLite (aiosqlite)
 ├── requirements.txt
 ├── .env.example
 └── README.md
 ```
 
-## Notes
+## Примечания
 
-- The bot stores data in `parser.db` (SQLite) in the current directory.
-- Seen listings are automatically cleaned up after 30 days.
-- The scraper uses HTML parsing with BeautifulSoup. If Ricardo.ch changes its markup, the scraper selectors may need to be updated.
+- Данные хранятся в `parser.db` (SQLite) в текущей директории.
+- Просмотренные объявления автоматически удаляются через 30 дней.
+- Парсер использует HTML-разбор через BeautifulSoup. При изменении разметки Ricardo.ch может потребоваться обновление селекторов.
