@@ -3,9 +3,10 @@
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qs, urljoin
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -22,43 +23,32 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Base URL for ricardo.ch search
-SEARCH_URL = "https://www.ricardo.ch/de/suche/"
-
 # ─── Category definitions ────────────────────────────────────────────────────
+# key → (Russian name, base URL)
 CATEGORIES: dict[str, str] = {
-    "all": "Alle Kategorien",
-    "antiques": "Antiquitäten & Kunst",
-    "auto": "Auto & Zubehör",
-    "baby": "Baby & Kind",
-    "books": "Bücher & Comics",
-    "computers": "Computer & Zubehör",
-    "electronics": "Elektronik & Foto",
-    "fashion": "Mode & Kleidung",
-    "home": "Heim & Garten",
-    "hobby": "Hobby & Freizeit",
-    "music": "Musik, Filme & Spiele",
-    "sports": "Sport & Outdoor",
-    "tickets": "Tickets & Gutscheine",
-    "other": "Sonstiges",
+    "hats":              "Шляпы, шапки, кепки (женские)",
+    "shoes_men":         "Мужская обувь",
+    "wedding":           "Свадьба и аксессуары",
+    "backpacks":         "Рюкзаки",
+    "folk":              "Народная мода",
+    "clothing":          "Одежда и аксессуары",
+    "blouses":           "Блузки и туники",
+    "accessories_women": "Аксессуары для женщин",
 }
 
-# Mapping from category key to Ricardo URL slug
-CATEGORY_SLUGS: dict[str, str] = {
-    "antiques": "antiquitaten-kunst",
-    "auto": "auto-zubehor",
-    "baby": "baby-kind",
-    "books": "bucher-comics-zeitschriften",
-    "computers": "computer-zubehor",
-    "electronics": "elektronik-foto",
-    "fashion": "mode-kleidung",
-    "home": "heim-garten",
-    "hobby": "hobby-freizeit",
-    "music": "musik-filme-spiele",
-    "sports": "sport-outdoor",
-    "tickets": "tickets-gutscheine",
-    "other": "sonstiges",
+CATEGORY_URLS: dict[str, str] = {
+    "hats":              "https://www.ricardo.ch/de/c/huete-muetzen-caps-fuer-damen-73899/",
+    "shoes_men":         "https://www.ricardo.ch/de/c/herrenschuhe-40822/?attribute_groups.shoe_type=120",
+    "wedding":           "https://www.ricardo.ch/de/c/hochzeit-hochzeitsdeko-zubehoer-40836/",
+    "backpacks":         "https://www.ricardo.ch/de/c/ruecksaecke-63791/",
+    "folk":              "https://www.ricardo.ch/de/c/trachtenmode-40839/",
+    "clothing":          "https://www.ricardo.ch/de/c/kleidung-accessoires-40842/",
+    "blouses":           "https://www.ricardo.ch/de/c/blusen-und-tunika-40780/",
+    "accessories_women": "https://www.ricardo.ch/de/c/accessoires-fuer-damen-40749/",
 }
+
+# Number of pages to scan per category per monitoring run
+PAGES_PER_CATEGORY = 2
 
 
 @dataclass
@@ -73,31 +63,47 @@ class Listing:
     seller_name: str = ""
     seller_url: str = ""
     seller_registered: Optional[datetime] = None
+    sold_count: Optional[int] = None
+    purchases_count: Optional[int] = None
     description: str = ""
 
     def matches(self, filters: dict) -> bool:
         """Return True if this listing passes all active filters."""
         min_p = filters.get("min_price")
         max_p = filters.get("max_price")
-        max_age_h = filters.get("max_listing_age_h")
-        max_reg = filters.get("max_seller_reg_date")  # ISO date string
+        seller_reg_before = filters.get("max_seller_reg_date")  # ISO date string
+        listing_from = filters.get("listing_date_from")  # ISO datetime string
+        listing_to = filters.get("listing_date_to")  # ISO datetime string
+        min_sold = filters.get("min_sold")
+        min_purchases = filters.get("min_purchases")
 
         if min_p is not None and self.price is not None and self.price < min_p:
             return False
         if max_p is not None and self.price is not None and self.price > max_p:
             return False
 
-        if max_age_h is not None and self.posted_at is not None:
-            now = datetime.now(timezone.utc)
+        if listing_from and self.posted_at:
+            from_dt = datetime.fromisoformat(listing_from)
             posted = self.posted_at
             if posted.tzinfo is None:
                 posted = posted.replace(tzinfo=timezone.utc)
-            age_h = (now - posted).total_seconds() / 3600
-            if age_h > max_age_h:
+            if from_dt.tzinfo is None:
+                from_dt = from_dt.replace(tzinfo=timezone.utc)
+            if posted < from_dt:
                 return False
 
-        if max_reg and self.seller_registered:
-            max_dt = datetime.fromisoformat(max_reg)
+        if listing_to and self.posted_at:
+            to_dt = datetime.fromisoformat(listing_to)
+            posted = self.posted_at
+            if posted.tzinfo is None:
+                posted = posted.replace(tzinfo=timezone.utc)
+            if to_dt.tzinfo is None:
+                to_dt = to_dt.replace(tzinfo=timezone.utc)
+            if posted > to_dt:
+                return False
+
+        if seller_reg_before and self.seller_registered:
+            max_dt = datetime.fromisoformat(seller_reg_before)
             reg = self.seller_registered
             if reg.tzinfo is None:
                 reg = reg.replace(tzinfo=timezone.utc)
@@ -106,29 +112,42 @@ class Listing:
             if reg > max_dt:
                 return False
 
+        if min_sold is not None and self.sold_count is not None and self.sold_count < min_sold:
+            return False
+
+        if min_purchases is not None and self.purchases_count is not None and self.purchases_count < min_purchases:
+            return False
+
         return True
 
     def format_message(self) -> str:
-        price_str = f"CHF {self.price:.2f}" if self.price is not None else "Preis auf Anfrage"
+        price_str = f"CHF {self.price:.2f}" if self.price is not None else "Цена по запросу"
         posted_str = (
             self.posted_at.strftime("%d.%m.%Y %H:%M")
             if self.posted_at
-            else "Unbekannt"
+            else "Неизвестно"
         )
         reg_str = (
-            self.seller_registered.strftime("%d.%m.%Y")
+            self.seller_registered.strftime("%d.%m.%Y %H:%M")
             if self.seller_registered
-            else "Unbekannt"
+            else "Неизвестно"
         )
         lines = [
             f"🛍 <b>{self.title}</b>",
-            f"💰 {price_str}",
-            f"📅 Eingestellt: {posted_str}",
-            f"👤 Verkäufer: {self.seller_name or 'Unbekannt'} (Mitglied seit {reg_str})",
+            f"💰 Цена: {price_str}",
+            f"🔗 <a href=\"{self.url}\">Ссылка на объявление</a>",
+            f"📅 Дата публикации: {posted_str}",
+            f"👤 Продавец: <b>{self.seller_name or 'Неизвестно'}</b>",
+            f"📆 Дата регистрации продавца: {reg_str}",
         ]
+        if self.sold_count is not None:
+            lines.append(f"📦 Продано товаров: {self.sold_count}")
+        if self.purchases_count is not None:
+            lines.append(f"🛒 Покупок у продавца: {self.purchases_count}")
+        if self.seller_url:
+            lines.append(f"🏪 <a href=\"{self.seller_url}\">Профиль продавца</a>")
         if self.category:
-            lines.append(f"🏷 Kategorie: {self.category}")
-        lines.append(f"🔗 <a href=\"{self.url}\">Zur Anzeige</a>")
+            lines.append(f"🏷 Категория: {self.category}")
         return "\n".join(lines)
 
 
@@ -173,30 +192,86 @@ def _parse_relative_date(text: str) -> Optional[datetime]:
     return None
 
 
+def _add_page_param(base_url: str, page: int) -> str:
+    """Append page=N to a category URL, handling existing query strings."""
+    if page <= 1:
+        return base_url
+    parsed = urlparse(base_url)
+    qs = parsed.query
+    if qs:
+        return base_url + f"&page={page}"
+    # URL ends with '/' – use '?page=N'
+    return base_url.rstrip("/") + f"/?page={page}"
+
+
 # ─── Seller profile ───────────────────────────────────────────────────────────
 
-async def fetch_seller_registration(
+async def fetch_seller_info(
     session: aiohttp.ClientSession, seller_url: str
-) -> Optional[datetime]:
-    """Fetch seller profile and extract registration date."""
+) -> tuple[Optional[datetime], Optional[int], Optional[int]]:
+    """Fetch seller profile and return (registration_date, sold_count, purchases_count)."""
     if not seller_url:
-        return None
+        return None, None, None
+    # Normalise URL to the ratings page
+    ratings_url = seller_url
+    if "/ratings" not in ratings_url:
+        ratings_url = seller_url.rstrip("/") + "/ratings/"
     try:
-        async with session.get(seller_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(ratings_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
-                return None
+                return None, None, None
             html = await resp.text()
         soup = BeautifulSoup(html, "lxml")
-        # Look for "Mitglied seit" text
+
+        reg_date: Optional[datetime] = None
+        sold_count: Optional[int] = None
+        purchases_count: Optional[int] = None
+
+        # Registration date: look for "Mitglied seit" text
         for tag in soup.find_all(string=re.compile(r"Mitglied seit|member since", re.I)):
             parent = tag.parent
             text = parent.get_text(" ", strip=True)
             m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", text)
             if m:
-                return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)), tzinfo=timezone.utc)
+                reg_date = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)), tzinfo=timezone.utc)
+                break
+
+        # Sold count: look for patterns like "123 Bewertungen als Verkäufer" / "Verkäufe"
+        for tag in soup.find_all(string=re.compile(r"Verk[äa]ufer|Verk[äa]ufe|as seller", re.I)):
+            parent = tag.parent
+            text = parent.get_text(" ", strip=True)
+            m = re.search(r"(\d[\d\s']*)", text)
+            if m:
+                try:
+                    sold_count = int(m.group(1).replace(" ", "").replace("'", ""))
+                    break
+                except ValueError:
+                    pass
+
+        # Purchases count: look for "als Käufer" / "Käufe"
+        for tag in soup.find_all(string=re.compile(r"K[äa]ufer|K[äa]ufe|as buyer", re.I)):
+            parent = tag.parent
+            text = parent.get_text(" ", strip=True)
+            m = re.search(r"(\d[\d\s']*)", text)
+            if m:
+                try:
+                    purchases_count = int(m.group(1).replace(" ", "").replace("'", ""))
+                    break
+                except ValueError:
+                    pass
+
+        # Fallback: look for stat numbers in data-testid attributes
+        if sold_count is None:
+            for tag in soup.select("[data-testid*='seller-rating'], [data-testid*='sold'], [class*='sold']"):
+                m = re.search(r"(\d+)", tag.get_text())
+                if m:
+                    sold_count = int(m.group(1))
+                    break
+
+        return reg_date, sold_count, purchases_count
     except Exception as exc:
         logger.debug("seller profile fetch error: %s", exc)
-    return None
+    return None, None, None
 
 
 # ─── Main scraper ─────────────────────────────────────────────────────────────
@@ -210,51 +285,54 @@ async def fetch_listings(
     results: list[Listing] = []
     seen_ids: set[str] = set()
 
-    # Determine which category slugs to query
-    slugs: list[Optional[str]] = []
-    if not categories or "all" in categories:
-        slugs = [None]  # no category filter
+    # Determine which category keys to query
+    cat_keys: list[str]
+    if not categories:
+        cat_keys = list(CATEGORY_URLS.keys())
     else:
-        for cat in categories:
-            slug = CATEGORY_SLUGS.get(cat)
-            slugs.append(slug)
+        cat_keys = [c for c in categories if c in CATEGORY_URLS]
+        if not cat_keys:
+            cat_keys = list(CATEGORY_URLS.keys())
 
-    # If no keywords, use a broad empty query
-    query_terms = keywords if keywords else [""]
+    for cat_key in cat_keys:
+        base_url = CATEGORY_URLS[cat_key]
+        cat_name = CATEGORIES[cat_key]
 
-    for query in query_terms:
-        for slug in slugs:
-            params: dict = {
-                "q": query,
-                "sort": "newest",
-            }
-            url = SEARCH_URL
-            if slug:
-                url = f"https://www.ricardo.ch/de/c/{slug}/"
-                if query:
-                    params["q"] = query
+        for page in range(1, PAGES_PER_CATEGORY + 1):
+            url = _add_page_param(base_url, page)
+
+            # Append keyword search param if provided
+            params: dict = {}
+            if keywords:
+                params["q"] = " ".join(keywords)
 
             try:
                 async with session.get(
                     url,
-                    params=params,
+                    params=params if params else None,
+                    headers=HEADERS,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status != 200:
                         logger.warning("ricardo.ch returned %s for %s", resp.status, url)
-                        continue
+                        break
                     html = await resp.text()
             except Exception as exc:
                 logger.error("Error fetching %s: %s", url, exc)
-                continue
+                break
 
-            listings = _parse_search_page(html, CATEGORIES.get(slug or "all", ""))
-            for listing in listings:
+            page_listings = _parse_search_page(html, cat_name)
+            added = 0
+            for listing in page_listings:
                 if listing.listing_id not in seen_ids:
                     seen_ids.add(listing.listing_id)
                     results.append(listing)
+                    added += 1
 
-            # Polite delay between requests
+            # If no new listings on this page, stop paginating this category
+            if added == 0:
+                break
+
             await asyncio.sleep(1)
 
     return results
@@ -369,7 +447,7 @@ def _parse_card(card, category_name: str) -> Optional[Listing]:
 async def enrich_seller_info(
     session: aiohttp.ClientSession, listings: list[Listing]
 ) -> None:
-    """Fetch seller registration dates for listings that have a seller URL."""
+    """Fetch seller registration dates and stats for listings that have a seller URL."""
     tasks = []
     for listing in listings:
         if listing.seller_url:
@@ -379,6 +457,7 @@ async def enrich_seller_info(
 
 
 async def _enrich_one(session: aiohttp.ClientSession, listing: Listing) -> None:
-    listing.seller_registered = await fetch_seller_registration(
-        session, listing.seller_url
-    )
+    reg, sold, purchases = await fetch_seller_info(session, listing.seller_url)
+    listing.seller_registered = reg
+    listing.sold_count = sold
+    listing.purchases_count = purchases

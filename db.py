@@ -2,7 +2,7 @@
 
 import json
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timezone
 
 DB_PATH = "parser.db"
 
@@ -23,6 +23,10 @@ CREATE TABLE IF NOT EXISTS filters (
     max_price           REAL    DEFAULT NULL,
     max_seller_reg_date TEXT    DEFAULT NULL,
     max_listing_age_h   INTEGER DEFAULT NULL,
+    listing_date_from   TEXT    DEFAULT NULL,
+    listing_date_to     TEXT    DEFAULT NULL,
+    min_sold            INTEGER DEFAULT NULL,
+    min_purchases       INTEGER DEFAULT NULL,
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 """
@@ -36,6 +40,14 @@ CREATE TABLE IF NOT EXISTS seen_listings (
 );
 """
 
+# Columns added in later migrations
+_MIGRATION_COLUMNS = [
+    ("listing_date_from", "TEXT"),
+    ("listing_date_to",   "TEXT"),
+    ("min_sold",          "INTEGER"),
+    ("min_purchases",     "INTEGER"),
+]
+
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -43,6 +55,20 @@ async def init_db() -> None:
         await db.execute(CREATE_FILTERS)
         await db.execute(CREATE_SEEN)
         await db.commit()
+    await _migrate_db()
+
+
+async def _migrate_db() -> None:
+    """Add new columns to existing databases without breaking fresh installs."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for col, col_type in _MIGRATION_COLUMNS:
+            try:
+                await db.execute(
+                    f"ALTER TABLE filters ADD COLUMN {col} {col_type} DEFAULT NULL"
+                )
+                await db.commit()
+            except Exception:
+                pass  # column already exists
 
 
 async def ensure_user(user_id: int) -> None:
@@ -81,7 +107,11 @@ async def save_filters(user_id: int, data: dict) -> None:
                 min_price           = ?,
                 max_price           = ?,
                 max_seller_reg_date = ?,
-                max_listing_age_h   = ?
+                max_listing_age_h   = ?,
+                listing_date_from   = ?,
+                listing_date_to     = ?,
+                min_sold            = ?,
+                min_purchases       = ?
             WHERE user_id = ?
             """,
             (
@@ -91,6 +121,10 @@ async def save_filters(user_id: int, data: dict) -> None:
                 data.get("max_price"),
                 data.get("max_seller_reg_date"),
                 data.get("max_listing_age_h"),
+                data.get("listing_date_from"),
+                data.get("listing_date_to"),
+                data.get("min_sold"),
+                data.get("min_purchases"),
                 user_id,
             ),
         )
