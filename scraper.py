@@ -46,16 +46,13 @@ CATEGORIES: dict[str, str] = {
 }
 
 # ─── Probe settings ──────────────────────────────────────────────────────────
-# Ricardo listing IDs are assigned sequentially (monotonically increasing).
-# Example real ID from the problem statement: 1313109388 (April 2026).
-# Active listings cluster close together, so we probe contiguous windows
-# of IDs starting at a random anchor near recent activity.
-# A window of PROBE_WINDOW_SIZE IDs typically contains many real listings.
-LISTING_ID_ANCHOR = 1_313_109_388     # Known real listing ID (April 2026)
-PROBE_WINDOW_SPREAD = 20_000_000      # ±20M around anchor = covers recent listings
-PROBE_WINDOW_SIZE = 2_000             # Consecutive IDs per window
-LISTING_PROBE_BATCH = 100             # IDs per probe round
-LISTING_PROBE_CONCURRENCY = 10        # parallel fetches
+# Each ID is 10 digits and must start with "131":
+#   https://www.ricardo.ch/de/a/131xxxxxxx/
+# The trailing 7 digits are chosen at random, giving the range 1310000000–1319999999.
+LISTING_ID_PREFIX_MIN = 1_310_000_000  # 131 + 0000000
+LISTING_ID_PREFIX_MAX = 1_319_999_999  # 131 + 9999999
+LISTING_PROBE_BATCH = 100              # IDs per probe round
+LISTING_PROBE_CONCURRENCY = 10         # parallel fetches
 
 # German month names / abbreviations used on Ricardo.ch
 _DE_MONTHS: dict[str, int] = {
@@ -816,21 +813,13 @@ async def probe_batch(
     """
     Probe *n* listing IDs and return those that have SOFORT KAUFEN.
 
-    Strategy: pick a random window of contiguous IDs anchored near known-valid
-    listings.  Because Ricardo assigns IDs sequentially, a window of 2K
-    consecutive IDs near recent activity contains far more real listings than
-    the same number of IDs spread randomly across 300M.
+    All IDs start with "131" followed by 7 random digits:
+      https://www.ricardo.ch/de/a/131xxxxxxx/
     """
-    # Pick a random start offset within ±PROBE_WINDOW_SPREAD of the anchor.
-    # Clamp to ensure IDs stay 10 digits.
-    anchor = LISTING_ID_ANCHOR
-    offset = random.randint(-PROBE_WINDOW_SPREAD, PROBE_WINDOW_SPREAD)
-    window_start = max(1_000_000_000, anchor + offset)
-    # Spread n IDs over a PROBE_WINDOW_SIZE-wide consecutive block
-    window_end = window_start + PROBE_WINDOW_SIZE
-    # Use sample to guarantee unique IDs within a batch (window_size >> n)
-    population = range(window_start, window_end + 1)
-    ids = [str(x) for x in random.sample(population, min(n, len(population)))]
+    ids = [
+        str(random.randint(LISTING_ID_PREFIX_MIN, LISTING_ID_PREFIX_MAX))
+        for _ in range(n)
+    ]
 
     sem = asyncio.Semaphore(LISTING_PROBE_CONCURRENCY)
     results: list[Listing] = []
@@ -838,8 +827,8 @@ async def probe_batch(
     debug_save: list = []
 
     logger.info(
-        "🔍 Проверяем %d ID в окне [%d–%d]",
-        n, window_start, window_end,
+        "🔍 Проверяем %d ID в диапазоне [131xxxxxxx]",
+        n,
     )
 
     async def probe_one(lid: str) -> None:
