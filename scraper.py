@@ -759,8 +759,8 @@ async def fetch_listing_detail_tracked(
     # Save first live HTML for offline debugging
     if not debug_save:
         try:
-            import os
-            path = f"/tmp/ricardo_debug_{listing_id}.html"
+            import tempfile, os
+            path = os.path.join(tempfile.gettempdir(), f"ricardo_debug_{listing_id}.html")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(html)
             debug_save.append(path)
@@ -828,7 +828,9 @@ async def probe_batch(
     window_start = max(1_000_000_000, anchor + offset)
     # Spread n IDs over a PROBE_WINDOW_SIZE-wide consecutive block
     window_end = window_start + PROBE_WINDOW_SIZE
-    ids = [str(random.randint(window_start, window_end)) for _ in range(n)]
+    # Use sample to guarantee unique IDs within a batch (window_size >> n)
+    population = range(window_start, window_end + 1)
+    ids = [str(x) for x in random.sample(population, min(n, len(population)))]
 
     sem = asyncio.Semaphore(LISTING_PROBE_CONCURRENCY)
     results: list[Listing] = []
