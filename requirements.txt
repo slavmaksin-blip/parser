@@ -1,0 +1,7 @@
+python-telegram-bot==20.7
+aiohttp==3.13.3
+beautifulsoup4==4.12.3
+aiosqlite==0.20.0
+APScheduler==3.10.4
+python-dotenv==1.0.1
+lxml==5.2.1
