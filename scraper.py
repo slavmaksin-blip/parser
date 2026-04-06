@@ -45,12 +45,17 @@ CATEGORIES: dict[str, str] = {
     "accessories_women": "Аксессуары для женщин",
 }
 
-# ─── Random-probe settings ────────────────────────────────────────────────────
-# IDs like 1313109388 are 10 digits in the ~1.2B–1.5B range.
-LISTING_ID_MIN = 1_200_000_000
-LISTING_ID_MAX = 1_500_000_000
-LISTING_PROBE_BATCH = 50         # IDs per probe round
-LISTING_PROBE_CONCURRENCY = 10   # parallel fetches
+# ─── Probe settings ──────────────────────────────────────────────────────────
+# Ricardo listing IDs are assigned sequentially (monotonically increasing).
+# Example real ID from the problem statement: 1313109388 (April 2026).
+# Active listings cluster close together, so we probe contiguous windows
+# of IDs starting at a random anchor near recent activity.
+# A window of PROBE_WINDOW_SIZE IDs typically contains many real listings.
+LISTING_ID_ANCHOR = 1_313_109_388     # Known real listing ID (April 2026)
+PROBE_WINDOW_SPREAD = 20_000_000      # ±20M around anchor = covers recent listings
+PROBE_WINDOW_SIZE = 2_000             # Consecutive IDs per window
+LISTING_PROBE_BATCH = 100             # IDs per probe round
+LISTING_PROBE_CONCURRENCY = 10        # parallel fetches
 
 # German month names / abbreviations used on Ricardo.ch
 _DE_MONTHS: dict[str, int] = {
@@ -679,6 +684,8 @@ async def fetch_listing_detail(
     """
     Fetch https://www.ricardo.ch/de/a/{listing_id}/ and return a Listing
     if and only if the page has a SOFORT KAUFEN offer.
+    Returns (listing_or_None, status_code_or_0, rejection_reason).
+    Internal: callers use fetch_listing_detail_tracked().
     """
     url = f"https://www.ricardo.ch/de/a/{listing_id}/"
     try:
@@ -714,6 +721,74 @@ async def fetch_listing_detail(
     return listing
 
 
+async def fetch_listing_detail_tracked(
+    session: aiohttp.ClientSession,
+    listing_id: str,
+    stats: dict,
+    debug_save: list,
+) -> Optional["Listing"]:
+    """
+    Like fetch_listing_detail but records a per-probe outcome into *stats*
+    and optionally saves the first live page HTML for debugging.
+    """
+    url = f"https://www.ricardo.ch/de/a/{listing_id}/"
+    html = None
+    try:
+        async with session.get(
+            url,
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True,
+        ) as resp:
+            code = resp.status
+            if code != 200:
+                stats[f"http_{code}"] = stats.get(f"http_{code}", 0) + 1
+                return None
+            final_url = str(resp.url)
+            if "/a/" not in final_url and "ricardo" in final_url:
+                stats["redirect_dead"] = stats.get("redirect_dead", 0) + 1
+                return None
+            html = await resp.text()
+    except Exception as exc:
+        stats["network_err"] = stats.get("network_err", 0) + 1
+        logger.debug("probe(%s) error: %s", listing_id, exc)
+        return None
+
+    stats["http_200"] = stats.get("http_200", 0) + 1
+
+    # Save first live HTML for offline debugging
+    if not debug_save:
+        try:
+            import os
+            path = f"/tmp/ricardo_debug_{listing_id}.html"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            debug_save.append(path)
+            logger.info("🗒 Первый 200-ответ сохранён в %s (для отладки)", path)
+        except Exception:
+            debug_save.append("error")
+
+    # Check for SOFORT KAUFEN presence
+    has_sofort = bool(re.search(r"sofort.{0,2}kauf", html, re.I))
+    if not has_sofort:
+        stats["no_sofort"] = stats.get("no_sofort", 0) + 1
+        return None
+
+    # Try __NEXT_DATA__ first
+    nd = _extract_next_data(html)
+    if nd:
+        listing = _listing_from_next_data(nd, listing_id, url)
+        if listing:
+            return listing
+        stats["json_no_article"] = stats.get("json_no_article", 0) + 1
+
+    # HTML fallback
+    listing = _listing_from_html(html, listing_id, url)
+    if not listing:
+        stats["html_no_parse"] = stats.get("html_no_parse", 0) + 1
+    return listing
+
+
 # ─── Seller enrichment ────────────────────────────────────────────────────────
 
 async def enrich_seller_info(
@@ -739,26 +814,72 @@ async def probe_batch(
     n: int = LISTING_PROBE_BATCH,
 ) -> list[Listing]:
     """
-    Probe *n* random listing IDs and return those that have SOFORT KAUFEN.
-    IDs are 10-digit integers in the LISTING_ID_MIN..LISTING_ID_MAX range.
+    Probe *n* listing IDs and return those that have SOFORT KAUFEN.
+
+    Strategy: pick a random window of contiguous IDs anchored near known-valid
+    listings.  Because Ricardo assigns IDs sequentially, a window of 2K
+    consecutive IDs near recent activity contains far more real listings than
+    the same number of IDs spread randomly across 300M.
     """
-    ids = [str(random.randint(LISTING_ID_MIN, LISTING_ID_MAX)) for _ in range(n)]
+    # Pick a random start offset within ±PROBE_WINDOW_SPREAD of the anchor.
+    # Clamp to ensure IDs stay 10 digits.
+    anchor = LISTING_ID_ANCHOR
+    offset = random.randint(-PROBE_WINDOW_SPREAD, PROBE_WINDOW_SPREAD)
+    window_start = max(1_000_000_000, anchor + offset)
+    # Spread n IDs over a PROBE_WINDOW_SIZE-wide consecutive block
+    window_end = window_start + PROBE_WINDOW_SIZE
+    ids = [str(random.randint(window_start, window_end)) for _ in range(n)]
+
     sem = asyncio.Semaphore(LISTING_PROBE_CONCURRENCY)
     results: list[Listing] = []
+    stats: dict = {}
+    debug_save: list = []
 
-    logger.info("🔍 Проверяем %d случайных ID [%d–%d]", n, LISTING_ID_MIN, LISTING_ID_MAX)
+    logger.info(
+        "🔍 Проверяем %d ID в окне [%d–%d]",
+        n, window_start, window_end,
+    )
 
     async def probe_one(lid: str) -> None:
         async with sem:
-            listing = await fetch_listing_detail(session, lid)
+            listing = await fetch_listing_detail_tracked(session, lid, stats, debug_save)
             if listing:
-                logger.info("✅ Найдено объявление: [%s] %s (CHF %.0f)",
+                logger.info("✅ Найдено: [%s] %s (CHF %.0f)",
                             lid, listing.title, listing.price or 0)
                 results.append(listing)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
 
     await asyncio.gather(*[probe_one(lid) for lid in ids], return_exceptions=True)
-    logger.info("📊 Батч завершён: %d/%d ID — найдено SOFORT KAUFEN объявлений", len(results), n)
+
+    # ── Diagnostic summary ────────────────────────────────────────────────
+    parts = []
+    total_200 = stats.get("http_200", 0)
+    parts.append(f"200: {total_200}")
+    for code in (404, 403, 301, 302):
+        v = stats.get(f"http_{code}", 0)
+        if v:
+            parts.append(f"{code}: {v}")
+    if stats.get("redirect_dead"):
+        parts.append(f"redirect: {stats['redirect_dead']}")
+    if stats.get("network_err"):
+        parts.append(f"err: {stats['network_err']}")
+    if stats.get("no_sofort"):
+        parts.append(f"no-sofort: {stats['no_sofort']}")
+    if stats.get("json_no_article"):
+        parts.append(f"json-miss: {stats['json_no_article']}")
+    if stats.get("html_no_parse"):
+        parts.append(f"html-miss: {stats['html_no_parse']}")
+    other = n - sum(v for k, v in stats.items()
+                    if k.startswith("http_") or k in
+                    ("redirect_dead", "network_err", "no_sofort",
+                     "json_no_article", "html_no_parse"))
+    if other > 0:
+        parts.append(f"other: {other}")
+
+    logger.info(
+        "📊 Батч завершён: %d/%d найдено | %s",
+        len(results), n, ", ".join(parts),
+    )
     return results
 
 
