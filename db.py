@@ -10,7 +10,7 @@ CREATE_USERS = """
 CREATE TABLE IF NOT EXISTS users (
     user_id    INTEGER PRIMARY KEY,
     active     INTEGER DEFAULT 0,
-    interval   INTEGER DEFAULT 30
+    interval   INTEGER DEFAULT 60
 );
 """
 
@@ -22,11 +22,11 @@ CREATE TABLE IF NOT EXISTS filters (
     min_price           REAL    DEFAULT NULL,
     max_price           REAL    DEFAULT NULL,
     max_seller_reg_date TEXT    DEFAULT NULL,
-    max_listing_age_h   INTEGER DEFAULT NULL,
-    listing_date_from   TEXT    DEFAULT NULL,
-    listing_date_to     TEXT    DEFAULT NULL,
     min_sold            INTEGER DEFAULT NULL,
-    min_purchases       INTEGER DEFAULT NULL,
+    listing_type        TEXT    DEFAULT NULL,
+    condition           TEXT    DEFAULT NULL,
+    location            TEXT    DEFAULT NULL,
+    delivery            TEXT    DEFAULT NULL,
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 """
@@ -40,12 +40,22 @@ CREATE TABLE IF NOT EXISTS seen_listings (
 );
 """
 
-# Columns added in later migrations
+# Columns added in later migrations (column_name, sql_type, default_expr)
 _MIGRATION_COLUMNS = [
-    ("listing_date_from", "TEXT"),
-    ("listing_date_to",   "TEXT"),
-    ("min_sold",          "INTEGER"),
-    ("min_purchases",     "INTEGER"),
+    ("min_sold",            "INTEGER", "NULL"),
+    ("listing_type",        "TEXT",    "NULL"),
+    ("condition",           "TEXT",    "NULL"),
+    ("location",            "TEXT",    "NULL"),
+    ("delivery",            "TEXT",    "NULL"),
+]
+
+# Old columns that existed in earlier schema — we just ignore errors if they
+# don't exist or can't be dropped in SQLite.
+_OBSOLETE_COLUMNS = [
+    "max_listing_age_h",
+    "listing_date_from",
+    "listing_date_to",
+    "min_purchases",
 ]
 
 
@@ -61,10 +71,17 @@ async def init_db() -> None:
 async def _migrate_db() -> None:
     """Add new columns to existing databases without breaking fresh installs."""
     async with aiosqlite.connect(DB_PATH) as db:
-        for col, col_type in _MIGRATION_COLUMNS:
+        # Migrate users table: ensure interval column exists with new default
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN interval INTEGER DEFAULT 60")
+            await db.commit()
+        except Exception:
+            pass
+
+        for col, col_type, default in _MIGRATION_COLUMNS:
             try:
                 await db.execute(
-                    f"ALTER TABLE filters ADD COLUMN {col} {col_type} DEFAULT NULL"
+                    f"ALTER TABLE filters ADD COLUMN {col} {col_type} DEFAULT {default}"
                 )
                 await db.commit()
             except Exception:
@@ -92,8 +109,8 @@ async def get_filters(user_id: int) -> dict:
     if row is None:
         return {}
     result = dict(row)
-    result["keywords"] = json.loads(result["keywords"] or "[]")
-    result["categories"] = json.loads(result["categories"] or "[]")
+    result["keywords"] = json.loads(result.get("keywords") or "[]")
+    result["categories"] = json.loads(result.get("categories") or "[]")
     return result
 
 
@@ -107,11 +124,11 @@ async def save_filters(user_id: int, data: dict) -> None:
                 min_price           = ?,
                 max_price           = ?,
                 max_seller_reg_date = ?,
-                max_listing_age_h   = ?,
-                listing_date_from   = ?,
-                listing_date_to     = ?,
                 min_sold            = ?,
-                min_purchases       = ?
+                listing_type        = ?,
+                condition           = ?,
+                location            = ?,
+                delivery            = ?
             WHERE user_id = ?
             """,
             (
@@ -120,11 +137,11 @@ async def save_filters(user_id: int, data: dict) -> None:
                 data.get("min_price"),
                 data.get("max_price"),
                 data.get("max_seller_reg_date"),
-                data.get("max_listing_age_h"),
-                data.get("listing_date_from"),
-                data.get("listing_date_to"),
                 data.get("min_sold"),
-                data.get("min_purchases"),
+                data.get("listing_type"),
+                data.get("condition"),
+                data.get("location"),
+                data.get("delivery"),
                 user_id,
             ),
         )
@@ -184,3 +201,15 @@ async def cleanup_old_seen(days: int = 30) -> None:
             (f"-{days} days",),
         )
         await db.commit()
+
+
+async def get_interval(user_id: int) -> int:
+    """Return the polling interval in seconds for a user (default 60)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT interval FROM users WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if row and row[0]:
+        return int(row[0])
+    return 60

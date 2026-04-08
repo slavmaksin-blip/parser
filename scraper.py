@@ -1,60 +1,89 @@
 """Async scraper for ricardo.ch listings.
 
-Approach: probe random 10-digit listing IDs on https://www.ricardo.ch/de/a/{ID}/.
-A listing is accepted only if the page contains a SOFORT KAUFEN button.
-Extracted fields: title, date, price (Sofort-Kaufpreis), seller nickname.
-Seller details are fetched from https://www.ricardo.ch/de/shop/{nick}/ratings/.
+Approach 1 (keyword search): fetch search results page for given keywords.
+Approach 2 (probe fallback): probe random 10-digit listing IDs starting with "131".
 """
 
 import asyncio
 import json
-import logging
 import random
 import re
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Any
 
 import aiohttp
 from bs4 import BeautifulSoup
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+# ─── User-Agent pool ──────────────────────────────────────────────────────────
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
 
-# ─── HTTP headers ────────────────────────────────────────────────────────────
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+try:
+    from fake_useragent import UserAgent as _UA
+    _ua_gen = _UA()
 
-# ─── Category definitions (kept for filter UI labels) ─────────────────────────
+    def _random_ua() -> str:
+        try:
+            return _ua_gen.random
+        except Exception:
+            return random.choice(_UA_POOL)
+except Exception:
+    def _random_ua() -> str:
+        return random.choice(_UA_POOL)
+
+
+def _headers() -> dict:
+    return {
+        "User-Agent": _random_ua(),
+        "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+# ─── Category definitions ──────────────────────────────────────────────────────
 CATEGORIES: dict[str, str] = {
-    "hats":              "Шляпы, шапки, кепки (женские)",
-    "shoes_men":         "Мужская обувь",
-    "wedding":           "Свадьба и аксессуары",
-    "backpacks":         "Рюкзаки",
-    "folk":              "Народная мода",
-    "clothing":          "Одежда и аксессуары",
-    "blouses":           "Блузки и туники",
-    "accessories_women": "Аксессуары для женщин",
+    # Root categories
+    "elektronik":  "Elektronik",
+    "mode":        "Mode & Accessoires",
+    "auto":        "Auto, Motorrad & Fahrrad",
+    "haus":        "Haus & Garten",
+    "sammeln":     "Sammeln & Seltenes",
+    "sport":       "Sport & Freizeit",
+    "uhren":       "Uhren & Schmuck",
+    "baby":        "Baby & Kind",
+    "buecher":     "Bücher, Filme & Musik",
+    # Sub-categories
+    "smartphones": "Smartphones",
+    "laptops":     "Laptops & Computer",
+    "tablets":     "Tablets",
+    "tv":          "TV & Audio",
+    "kameras":     "Kameras & Zubehör",
+    "herren":      "Herrenbekleidung",
+    "damen":       "Damenbekleidung",
+    "schuhe":      "Schuhe",
+    "taschen":     "Taschen & Geldbörsen",
+    "fahrrad":     "Fahrräder",
+    "moebel":      "Möbel",
+    "garten":      "Garten",
 }
 
-# ─── Probe settings ──────────────────────────────────────────────────────────
-# Each ID is 10 digits and must start with "131":
-#   https://www.ricardo.ch/de/a/131xxxxxxx/
-# The trailing 7 digits are chosen at random, giving the range 1310000000–1319999999.
-LISTING_ID_PREFIX_MIN = 1_310_000_000  # 131 + 0000000
-LISTING_ID_PREFIX_MAX = 1_319_999_999  # 131 + 9999999
-LISTING_PROBE_BATCH = 100              # IDs per probe round
-LISTING_PROBE_CONCURRENCY = 10         # parallel fetches
+# ─── Probe settings ────────────────────────────────────────────────────────────
+LISTING_ID_PREFIX_MIN = 1_310_000_000
+LISTING_ID_PREFIX_MAX = 1_319_999_999
+LISTING_PROBE_BATCH = 100
+LISTING_PROBE_CONCURRENCY = 10
 
-# German month names / abbreviations used on Ricardo.ch
+# German month abbreviations
 _DE_MONTHS: dict[str, int] = {
     "jan": 1, "feb": 2, "mär": 3, "mrz": 3, "mar": 3,
     "apr": 4, "mai": 5, "jun": 6, "jul": 7, "aug": 8,
@@ -79,31 +108,32 @@ class Listing:
     sold_count: Optional[int] = None
     purchases_count: Optional[int] = None
     description: str = ""
+    listing_type: str = ""
+    condition: str = ""
+    location: str = ""
+    delivery: str = ""
+    views_count: Optional[int] = None
+    bids_count: Optional[int] = None
+    end_date: Optional[datetime] = None
+    seller_rating: Optional[float] = None
 
     def matches(self, filters: dict) -> bool:
         """Return True if this listing passes all active filters."""
         min_p = filters.get("min_price")
         max_p = filters.get("max_price")
         seller_reg_before = filters.get("max_seller_reg_date")
-        listing_from = filters.get("listing_date_from")
-        listing_to = filters.get("listing_date_to")
         min_sold = filters.get("min_sold")
-        min_purchases = filters.get("min_purchases")
+        f_listing_type = filters.get("listing_type")
+        f_condition = filters.get("condition")
+        f_location = filters.get("location")
+        f_delivery = filters.get("delivery")
+        keywords = filters.get("keywords") or []
+        categories = filters.get("categories") or []
 
         if min_p is not None and self.price is not None and self.price < min_p:
             return False
         if max_p is not None and self.price is not None and self.price > max_p:
             return False
-
-        if listing_from and self.posted_at:
-            from_dt = _ensure_tz(datetime.fromisoformat(listing_from))
-            if _ensure_tz(self.posted_at) < from_dt:
-                return False
-
-        if listing_to and self.posted_at:
-            to_dt = _ensure_tz(datetime.fromisoformat(listing_to))
-            if _ensure_tz(self.posted_at) > to_dt:
-                return False
 
         if seller_reg_before and self.seller_registered:
             max_dt = _ensure_tz(datetime.fromisoformat(seller_reg_before))
@@ -112,8 +142,29 @@ class Listing:
 
         if min_sold is not None and self.sold_count is not None and self.sold_count < min_sold:
             return False
-        if min_purchases is not None and self.purchases_count is not None and self.purchases_count < min_purchases:
-            return False
+
+        if f_listing_type and f_listing_type.lower() not in ("все", "all", ""):
+            if self.listing_type and f_listing_type.lower() not in self.listing_type.lower():
+                return False
+
+        if f_condition and f_condition.lower() not in ("alle", "all", "все", ""):
+            if self.condition and f_condition.lower() not in self.condition.lower():
+                return False
+
+        if f_location and f_location.strip():
+            if self.location and f_location.lower() not in self.location.lower():
+                return False
+
+        if f_delivery and f_delivery.lower() not in ("beides", "all", "все", ""):
+            if self.delivery and f_delivery.lower() not in self.delivery.lower():
+                return False
+
+        if categories:
+            if self.category:
+                cat_lower = self.category.lower()
+                if not any(c.lower() in cat_lower or cat_lower in c.lower()
+                           for c in categories):
+                    return False
 
         return True
 
@@ -131,18 +182,24 @@ class Listing:
         )
         lines = [
             f"🛍 <b>{self.title}</b>",
-            f"💰 Цена (Sofort-Kaufpreis): {price_str}",
-            f"🔗 <a href=\"{self.url}\">Ссылка на объявление</a>",
-            f"📅 Дата публикации: {posted_str}",
-            f"👤 Продавец: <b>{self.seller_name or 'Неизвестно'}</b>",
-            f"📆 Mitglied seit: {reg_str}",
+            f"💰 {price_str}",
         ]
+        if self.category:
+            lines.append(f"📂 {self.category}")
+        if self.location:
+            lines.append(f"📍 {self.location}")
+        if self.condition:
+            lines.append(f"📦 Состояние: {self.condition}")
+        if self.listing_type:
+            lines.append(f"🏷 Тип: {self.listing_type}")
+        lines.append(f"📅 Опубликовано: {posted_str}")
+        if self.end_date:
+            lines.append(f"⏰ Окончание: {self.end_date.strftime('%d.%m.%Y %H:%M')}")
+        lines.append(f"👤 Продавец: <b>{self.seller_name or 'Неизвестно'}</b> (с {reg_str})")
         if self.sold_count is not None:
             lines.append(f"📦 Продано: {self.sold_count}")
-        if self.purchases_count is not None:
-            lines.append(f"🛒 Покупок: {self.purchases_count}")
-        if self.seller_url:
-            lines.append(f"🏪 <a href=\"{self.seller_url}\">Профиль продавца</a>")
+        if self.seller_rating is not None:
+            lines.append(f"⭐ Рейтинг: {self.seller_rating:.1f}")
         return "\n".join(lines)
 
 
@@ -162,7 +219,6 @@ def _parse_price(text: str) -> Optional[float]:
         .replace("CHF", "")
         .replace("Fr.", "")
     )
-    # Remove trailing em-dash (used for .00 in Swiss prices)
     text = re.sub(r"[–—.-]+$", "", text.strip())
     match = re.search(r"(\d[\d., ]*\d|\d)", text)
     if not match:
@@ -179,7 +235,6 @@ def _parse_price(text: str) -> Optional[float]:
 def _parse_german_datetime(text: str) -> Optional[datetime]:
     """Parse dates like '8. Apr. 2026, 17:45 Uhr' → datetime."""
     text = text.strip()
-    # With time
     m = re.search(
         r"(\d{1,2})\.\s*(\w+\.?)\s*(\d{4})[,\s]+(\d{1,2}):(\d{2})",
         text, re.I,
@@ -196,7 +251,6 @@ def _parse_german_datetime(text: str) -> Optional[datetime]:
                 return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
             except ValueError:
                 pass
-    # Date only
     m = re.search(r"(\d{1,2})\.\s*(\w+\.?)\s*(\d{4})", text, re.I)
     if m:
         day = int(m.group(1))
@@ -225,7 +279,6 @@ def _try_parse_date(raw: str) -> Optional[datetime]:
 # ─── __NEXT_DATA__ helpers ────────────────────────────────────────────────────
 
 def _extract_next_data(html: str) -> Optional[dict]:
-    """Extract and parse the __NEXT_DATA__ JSON from a Next.js page."""
     m = re.search(
         r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>\s*(\{.*?\})\s*</script>',
         html,
@@ -251,19 +304,11 @@ def _deep_get(d: Any, *keys: str) -> Any:
 
 
 def _find_article(nd: dict) -> Optional[dict]:
-    """
-    Locate the article/listing object inside __NEXT_DATA__.
-    Tries several known Ricardo.ch key paths.
-    """
     pp = _deep_get(nd, "props", "pageProps") or {}
-
-    # Direct keys on pageProps
     for key in ("article", "listing", "item", "product", "data", "articleData"):
         c = pp.get(key)
         if isinstance(c, dict) and c.get("id"):
             return c
-
-    # Nested under initialData / dehydratedState / serverData
     for wrapper in ("initialData", "dehydratedState", "serverData", "initialState"):
         w = pp.get(wrapper)
         if isinstance(w, dict):
@@ -271,18 +316,14 @@ def _find_article(nd: dict) -> Optional[dict]:
                 c = w.get(inner)
                 if isinstance(c, dict) and c.get("id"):
                     return c
-            # dehydratedState.queries[*].state.data
             for q in (w.get("queries") or []):
                 state = _deep_get(q, "state", "data")
                 if isinstance(state, dict) and state.get("id"):
                     return state
-
     return None
 
 
 def _extract_price_from_article(article: dict) -> Optional[float]:
-    """Extract buy-now price from an article dict."""
-    # Direct numeric fields
     for key in (
         "buyNowPrice", "sofortKaufPreis", "sofortpreis", "fixedPrice",
         "currentPrice", "price", "buyItNowPrice",
@@ -300,7 +341,6 @@ def _extract_price_from_article(article: dict) -> Optional[float]:
             if p:
                 return p
 
-    # Ricardo sometimes stores prices in a nested "prices" list/object
     prices = article.get("prices")
     if isinstance(prices, list):
         for p_obj in prices:
@@ -315,33 +355,26 @@ def _extract_price_from_article(article: dict) -> Optional[float]:
         for k, v in prices.items():
             if isinstance(v, (int, float)) and v > 0:
                 return float(v)
-
     return None
 
 
 def _is_sofort_kaufen_article(article: dict) -> bool:
-    """Return True if the article dict signals a buy-now listing."""
-    # Explicit type/mode fields
     for key in ("type", "listingType", "articleType", "saleType", "sellingType"):
         val = str(article.get(key) or "").lower()
         if val and any(k in val for k in ("buy_now", "buynow", "sofort", "fixed")):
             return True
-    # A buy-now price existing is sufficient signal
     return _extract_price_from_article(article) is not None
 
 
-def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional["Listing"]:
-    """Build a Listing from __NEXT_DATA__ JSON on an individual listing page."""
+def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional[Listing]:
     article = _find_article(nd)
     if not article:
         return None
-
     if not _is_sofort_kaufen_article(article):
         return None
 
     price = _extract_price_from_article(article)
 
-    # Title
     title: Optional[str] = None
     for key in ("title", "name", "articleTitle", "subject", "itemTitle"):
         t = article.get(key)
@@ -351,7 +384,6 @@ def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional["Li
     if not title:
         return None
 
-    # Date
     posted_at: Optional[datetime] = None
     for key in ("endDate", "startDate", "createdAt", "publishedAt",
                 "insertionDate", "activationDate", "expiryDate"):
@@ -361,9 +393,17 @@ def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional["Li
             if posted_at:
                 break
 
-    # Seller
+    end_date: Optional[datetime] = None
+    for key in ("endDate", "auctionEndDate", "expiryDate"):
+        raw = article.get(key)
+        if raw:
+            end_date = _try_parse_date(str(raw))
+            if end_date:
+                break
+
     seller_name = ""
     seller_url = ""
+    seller_rating: Optional[float] = None
     for sk in ("seller", "vendor", "user", "article_seller"):
         s = article.get(sk)
         if isinstance(s, dict):
@@ -372,12 +412,16 @@ def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional["Li
                 if isinstance(n, str) and n.strip():
                     seller_name = n.strip()
                     break
+            for rk in ("rating", "sellerRating", "score"):
+                rv = s.get(rk)
+                if isinstance(rv, (int, float)):
+                    seller_rating = float(rv)
+                    break
         if seller_name:
             break
     if seller_name:
         seller_url = f"https://www.ricardo.ch/de/shop/{seller_name}/ratings/"
 
-    # Image
     image_url = ""
     for ik in ("images", "photos", "gallery"):
         imgs = article.get(ik)
@@ -399,6 +443,63 @@ def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional["Li
                 image_url = v
                 break
 
+    # listing_type
+    listing_type = ""
+    for key in ("type", "listingType", "articleType", "saleType", "sellingType"):
+        raw = str(article.get(key) or "").lower()
+        if "sofort" in raw or "buy_now" in raw or "buynow" in raw or "fixed" in raw:
+            listing_type = "Sofortkauf"
+            break
+        elif "auction" in raw or "auktion" in raw or "bieten" in raw:
+            listing_type = "Auktion"
+            break
+        elif "festpreis" in raw or "fixed_price" in raw:
+            listing_type = "Festpreis"
+            break
+
+    # condition
+    condition = ""
+    for key in ("condition", "itemCondition", "articleCondition", "zustand"):
+        raw = str(article.get(key) or "")
+        if raw.strip():
+            condition = raw.strip()
+            break
+
+    # location
+    location = ""
+    for key in ("location", "city", "zip", "address", "region"):
+        raw = article.get(key)
+        if isinstance(raw, str) and raw.strip():
+            location = raw.strip()
+            break
+        elif isinstance(raw, dict):
+            city = raw.get("city") or raw.get("zip") or ""
+            if city:
+                location = str(city)
+                break
+
+    # delivery
+    delivery = ""
+    for key in ("delivery", "deliveryOptions", "shipping", "versand"):
+        raw = article.get(key)
+        if isinstance(raw, str) and raw.strip():
+            delivery = raw.strip()
+            break
+
+    # category
+    category = ""
+    for key in ("category", "categoryName", "mainCategory"):
+        raw = article.get(key)
+        if isinstance(raw, str) and raw.strip():
+            category = raw.strip()
+            break
+        elif isinstance(raw, dict):
+            for ck in ("name", "label", "title"):
+                cv = raw.get(ck)
+                if isinstance(cv, str) and cv.strip():
+                    category = cv.strip()
+                    break
+
     return Listing(
         listing_id=listing_id,
         title=title,
@@ -408,33 +509,25 @@ def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional["Li
         posted_at=posted_at,
         seller_name=seller_name,
         seller_url=seller_url,
+        seller_rating=seller_rating,
+        listing_type=listing_type,
+        condition=condition,
+        location=location,
+        delivery=delivery,
+        category=category,
+        end_date=end_date,
     )
 
 
 # ─── HTML fallback for individual listing pages ───────────────────────────────
 
 def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing]:
-    """
-    Parse an individual listing page with BeautifulSoup.
-    Requires the text "SOFORT KAUFEN" to be present anywhere on the page.
-    Extracts: title (h1), date ("8. Apr. 2026, 17:45 Uhr"),
-              price (Sofort-Kaufpreis label), seller (Verkäufer section).
-    """
-    # ── SOFORT KAUFEN check ────────────────────────────────────────────────
-    # Check both raw HTML (catches JSON strings) and rendered text
     has_sofort = bool(re.search(r"sofort.{0,2}kauf", html, re.I))
     if not has_sofort:
         return None
 
     soup = BeautifulSoup(html, "lxml")
-    page_text = soup.get_text(" ", strip=True)
 
-    # Double-check in rendered text (some pages embed it only in JSON)
-    if not re.search(r"sofort.{0,2}kauf", page_text, re.I):
-        # Still accept if it was in raw HTML (JSON data)
-        pass
-
-    # ── Title ─────────────────────────────────────────────────────────────
     title: Optional[str] = None
     h1 = soup.find("h1")
     if h1:
@@ -452,16 +545,13 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
     if not title:
         return None
 
-    # ── Date: "8. Apr. 2026, 17:45 Uhr" ──────────────────────────────────
     posted_at: Optional[datetime] = None
-    # Look in all text nodes
     for node in soup.find_all(string=re.compile(r"\d{1,2}\.\s+\w+\.?\s+\d{4}", re.I)):
         dt = _parse_german_datetime(str(node))
         if dt:
             posted_at = dt
             break
     if not posted_at:
-        # Try <time datetime="..."> elements
         for t_tag in soup.find_all("time"):
             da = t_tag.get("datetime") or t_tag.get_text(strip=True)
             if da:
@@ -470,7 +560,6 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
                     posted_at = dt
                     break
 
-    # ── Price: find "Sofort-Kaufpreis" label, then read sibling/parent ────
     price: Optional[float] = None
     for label_text in (
         "Sofort-Kaufpreis", "sofortkaufpreis", "Sofort Kaufpreis",
@@ -480,7 +569,6 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
         if label:
             container = label.find_parent()
             if container:
-                # Search siblings and parent
                 search_nodes = list(container.next_siblings) + [container.parent]
                 for node in search_nodes:
                     if not (node and hasattr(node, "get_text")):
@@ -493,10 +581,8 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
                 break
 
     if price is None:
-        # Generic: find any element with class containing "price" near buy-now context
         for tag in soup.find_all(class_=re.compile(r"price|preis|kaufpreis", re.I)):
             candidate = tag.get_text(" ", strip=True)
-            # Skip "Startpreis" (auction starting price)
             if re.search(r"start|auction|gebot|bieten", candidate, re.I):
                 continue
             p = _parse_price(candidate)
@@ -504,13 +590,11 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
                 price = p
                 break
 
-    # ── Seller: find "Verkäufer" label, then nearby link ─────────────────
     seller_name = ""
     seller_url = ""
     vk_node = soup.find(string=re.compile(r"Verk[äa]ufer", re.I))
     if vk_node:
         container = vk_node.find_parent()
-        # Walk up at most 3 levels to find a shop link
         for _ in range(3):
             if container is None:
                 break
@@ -523,7 +607,6 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
             container = container.parent
 
     if not seller_name:
-        # Fallback: any /de/shop/ link on the page
         for lnk in soup.find_all("a", href=re.compile(r"/de/shop/")):
             m = re.search(r"/de/shop/([^/]+)/", lnk.get("href", ""))
             if m:
@@ -533,13 +616,25 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
     if seller_name:
         seller_url = f"https://www.ricardo.ch/de/shop/{seller_name}/ratings/"
 
-    # ── Image ─────────────────────────────────────────────────────────────
     image_url = ""
     for img in soup.find_all("img"):
         src = img.get("src") or img.get("data-src") or ""
         if src.startswith("http") and re.search(r"ricardo|cdn|media|img", src, re.I):
             image_url = src
             break
+
+    # location
+    location = ""
+    page_text = soup.get_text(" ", strip=True)
+    m_loc = re.search(r"Standort[:\s]+([A-Za-zÀ-ÿ\s\-]+\d{4})", page_text)
+    if m_loc:
+        location = m_loc.group(1).strip()
+
+    # condition
+    condition = ""
+    m_cond = re.search(r"Zustand[:\s]+(Neu|Gebraucht|Wie neu|Defekt)", page_text, re.I)
+    if m_cond:
+        condition = m_cond.group(1).strip()
 
     return Listing(
         listing_id=listing_id,
@@ -550,6 +645,9 @@ def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing
         posted_at=posted_at,
         seller_name=seller_name,
         seller_url=seller_url,
+        listing_type="Sofortkauf",
+        condition=condition,
+        location=location,
     )
 
 
@@ -559,11 +657,6 @@ async def fetch_seller_info(
     session: aiohttp.ClientSession,
     seller_url: str,
 ) -> tuple[Optional[datetime], Optional[int], Optional[int]]:
-    """
-    Fetch https://www.ricardo.ch/de/shop/{nick}/ratings/
-    and return (registration_date, sold_count, purchases_count).
-    Looks for "Mitglied seit YYYY" pattern.
-    """
     if not seller_url:
         return None, None, None
     ratings_url = (
@@ -573,22 +666,21 @@ async def fetch_seller_info(
     try:
         async with session.get(
             ratings_url,
-            headers=HEADERS,
+            headers=_headers(),
             timeout=aiohttp.ClientTimeout(total=12),
         ) as resp:
             if resp.status != 200:
-                logger.debug("Seller page %s → HTTP %d", ratings_url, resp.status)
+                logger.debug("Seller page {} → HTTP {}", ratings_url, resp.status)
                 return None, None, None
             html = await resp.text()
     except Exception as exc:
-        logger.debug("Seller profile fetch error (%s): %s", ratings_url, exc)
+        logger.debug("Seller profile fetch error ({}): {}", ratings_url, exc)
         return None, None, None
 
     reg_date: Optional[datetime] = None
     sold_count: Optional[int] = None
     purchases_count: Optional[int] = None
 
-    # ── 1st try: __NEXT_DATA__ JSON ───────────────────────────────────────
     nd = _extract_next_data(html)
     if nd:
         pp = _deep_get(nd, "props", "pageProps") or {}
@@ -620,17 +712,14 @@ async def fetch_seller_info(
             if reg_date:
                 break
 
-    # ── 2nd try: HTML ─────────────────────────────────────────────────────
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text(" ", strip=True)
 
     if not reg_date:
-        # "Mitglied seit 2018" or "Mitglied seit 01.01.2018"
         m = re.search(r"Mitglied\s+seit\s+(\d{2}\.\d{2}\.(\d{4})|\d{4})", page_text, re.I)
         if m:
             full = m.group(1)
             if "." in full:
-                # DD.MM.YYYY
                 parts = full.split(".")
                 try:
                     reg_date = datetime(int(parts[2]), int(parts[1]), int(parts[0]),
@@ -641,17 +730,12 @@ async def fetch_seller_info(
                 reg_date = datetime(int(full), 1, 1, tzinfo=timezone.utc)
 
     if not reg_date:
-        # Broader fallback: any year after "seit"
         m = re.search(r"seit\s+(20\d{2}|19\d{2})\b", page_text, re.I)
         if m:
             reg_date = datetime(int(m.group(1)), 1, 1, tzinfo=timezone.utc)
 
     if sold_count is None:
-        # Ratings as seller
-        m = re.search(
-            r"als?\s+Verk[äa]ufer[^\d]*(\d[\d'.\s]*)",
-            page_text, re.I,
-        )
+        m = re.search(r"als?\s+Verk[äa]ufer[^\d]*(\d[\d'.\s]*)", page_text, re.I)
         if m:
             try:
                 sold_count = int(re.sub(r"['\s.]", "", m.group(1)))
@@ -659,10 +743,7 @@ async def fetch_seller_info(
                 pass
 
     if purchases_count is None:
-        m = re.search(
-            r"als?\s+K[äa]ufer[^\d]*(\d[\d'.\s]*)",
-            page_text, re.I,
-        )
+        m = re.search(r"als?\s+K[äa]ufer[^\d]*(\d[\d'.\s]*)", page_text, re.I)
         if m:
             try:
                 purchases_count = int(re.sub(r"['\s.]", "", m.group(1)))
@@ -672,50 +753,37 @@ async def fetch_seller_info(
     return reg_date, sold_count, purchases_count
 
 
-# ─── Individual listing page ──────────────────────────────────────────────────
+# ─── Individual listing fetch ─────────────────────────────────────────────────
 
 async def fetch_listing_detail(
     session: aiohttp.ClientSession,
     listing_id: str,
 ) -> Optional[Listing]:
-    """
-    Fetch https://www.ricardo.ch/de/a/{listing_id}/ and return a Listing
-    if and only if the page has a SOFORT KAUFEN offer.
-    Returns (listing_or_None, status_code_or_0, rejection_reason).
-    Internal: callers use fetch_listing_detail_tracked().
-    """
     url = f"https://www.ricardo.ch/de/a/{listing_id}/"
     try:
         async with session.get(
             url,
-            headers=HEADERS,
+            headers=_headers(),
             timeout=aiohttp.ClientTimeout(total=15),
             allow_redirects=True,
         ) as resp:
             if resp.status != 200:
                 return None
             final_url = str(resp.url)
-            # Redirected away from /a/ = dead listing
             if "/a/" not in final_url and "ricardo" in final_url:
                 return None
             html = await resp.text()
     except Exception as exc:
-        logger.debug("fetch_listing_detail(%s) network error: %s", listing_id, exc)
+        logger.debug("fetch_listing_detail({}) network error: {}", listing_id, exc)
         return None
 
-    # 1st: parse __NEXT_DATA__
     nd = _extract_next_data(html)
     if nd:
         listing = _listing_from_next_data(nd, listing_id, url)
         if listing:
-            logger.debug("✓ %s via JSON: %s", listing_id, listing.title)
             return listing
 
-    # 2nd: HTML fallback
-    listing = _listing_from_html(html, listing_id, url)
-    if listing:
-        logger.debug("✓ %s via HTML: %s", listing_id, listing.title)
-    return listing
+    return _listing_from_html(html, listing_id, url)
 
 
 async def fetch_listing_detail_tracked(
@@ -723,17 +791,13 @@ async def fetch_listing_detail_tracked(
     listing_id: str,
     stats: dict,
     debug_save: list,
-) -> Optional["Listing"]:
-    """
-    Like fetch_listing_detail but records a per-probe outcome into *stats*
-    and optionally saves the first live page HTML for debugging.
-    """
+) -> Optional[Listing]:
     url = f"https://www.ricardo.ch/de/a/{listing_id}/"
     html = None
     try:
         async with session.get(
             url,
-            headers=HEADERS,
+            headers=_headers(),
             timeout=aiohttp.ClientTimeout(total=15),
             allow_redirects=True,
         ) as resp:
@@ -748,30 +812,16 @@ async def fetch_listing_detail_tracked(
             html = await resp.text()
     except Exception as exc:
         stats["network_err"] = stats.get("network_err", 0) + 1
-        logger.debug("probe(%s) error: %s", listing_id, exc)
+        logger.debug("probe({}) error: {}", listing_id, exc)
         return None
 
     stats["http_200"] = stats.get("http_200", 0) + 1
 
-    # Save first live HTML for offline debugging
-    if not debug_save:
-        try:
-            import tempfile, os
-            path = os.path.join(tempfile.gettempdir(), f"ricardo_debug_{listing_id}.html")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(html)
-            debug_save.append(path)
-            logger.info("🗒 Первый 200-ответ сохранён в %s (для отладки)", path)
-        except Exception:
-            debug_save.append("error")
-
-    # Check for SOFORT KAUFEN presence
     has_sofort = bool(re.search(r"sofort.{0,2}kauf", html, re.I))
     if not has_sofort:
         stats["no_sofort"] = stats.get("no_sofort", 0) + 1
         return None
 
-    # Try __NEXT_DATA__ first
     nd = _extract_next_data(html)
     if nd:
         listing = _listing_from_next_data(nd, listing_id, url)
@@ -779,7 +829,6 @@ async def fetch_listing_detail_tracked(
             return listing
         stats["json_no_article"] = stats.get("json_no_article", 0) + 1
 
-    # HTML fallback
     listing = _listing_from_html(html, listing_id, url)
     if not listing:
         stats["html_no_parse"] = stats.get("html_no_parse", 0) + 1
@@ -804,18 +853,128 @@ async def _enrich_one(session: aiohttp.ClientSession, listing: Listing) -> None:
     listing.purchases_count = purchases
 
 
-# ─── Main probe batch ─────────────────────────────────────────────────────────
+# ─── Keyword search ───────────────────────────────────────────────────────────
+
+async def search_listings(
+    session: aiohttp.ClientSession,
+    keywords: list[str],
+    categories: list[str] | None = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    listing_type: Optional[str] = None,
+    condition: Optional[str] = None,
+    n: int = 20,
+) -> list[Listing]:
+    """Search Ricardo.ch by keywords and return found listings."""
+    if not keywords:
+        return []
+
+    keyword_str = " ".join(keywords)
+    encoded = urllib.parse.quote(keyword_str)
+    url = f"https://www.ricardo.ch/de/s/{encoded}/?sort=newest"
+    if min_price is not None:
+        url += f"&priceFrom={int(min_price)}"
+    if max_price is not None:
+        url += f"&priceTo={int(max_price)}"
+
+    logger.info("🔍 Поиск по ключевым словам: {} → {}", keyword_str, url)
+
+    try:
+        async with session.get(
+            url,
+            headers=_headers(),
+            timeout=aiohttp.ClientTimeout(total=20),
+            allow_redirects=True,
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("Search page returned HTTP {}", resp.status)
+                return []
+            html = await resp.text()
+    except Exception as exc:
+        logger.error("search_listings network error: {}", exc)
+        return []
+
+    # Extract listing IDs from links
+    found_ids: list[str] = []
+    # Try to extract from __NEXT_DATA__ first
+    nd = _extract_next_data(html)
+    if nd:
+        try:
+            pp = _deep_get(nd, "props", "pageProps") or {}
+            for key in ("articles", "listings", "items", "results", "data"):
+                items = pp.get(key)
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            lid = str(item.get("id") or item.get("articleId") or "")
+                            if lid.isdigit() and lid not in found_ids:
+                                found_ids.append(lid)
+                    if found_ids:
+                        break
+            # Try dehydratedState
+            if not found_ids:
+                dstate = pp.get("dehydratedState") or {}
+                for q in (dstate.get("queries") or []):
+                    data = _deep_get(q, "state", "data")
+                    if isinstance(data, dict):
+                        for key in ("articles", "listings", "items", "results"):
+                            items = data.get(key)
+                            if isinstance(items, list):
+                                for item in items:
+                                    if isinstance(item, dict):
+                                        lid = str(item.get("id") or item.get("articleId") or "")
+                                        if lid.isdigit() and lid not in found_ids:
+                                            found_ids.append(lid)
+        except Exception as exc:
+            logger.debug("search_listings JSON parse error: {}", exc)
+
+    # Fallback: extract IDs from HTML links
+    if not found_ids:
+        for m in re.finditer(r'/de/a/(\d{8,12})/', html):
+            lid = m.group(1)
+            if lid not in found_ids:
+                found_ids.append(lid)
+
+    if not found_ids:
+        # Try article-card data-testid patterns in HTML
+        soup = BeautifulSoup(html, "lxml")
+        for card in soup.find_all(attrs={"data-testid": re.compile(r"article-card", re.I)}):
+            lnk = card.find("a", href=re.compile(r"/de/a/\d+"))
+            if lnk:
+                m = re.search(r"/de/a/(\d+)/", lnk.get("href", ""))
+                if m and m.group(1) not in found_ids:
+                    found_ids.append(m.group(1))
+
+    logger.info("🔗 Найдено {} ID объявлений в поиске", len(found_ids))
+
+    # Fetch detail pages for found IDs (up to n)
+    found_ids = found_ids[:n]
+    results: list[Listing] = []
+    stats: dict = {}
+    debug_save: list = []
+
+    sem = asyncio.Semaphore(5)
+
+    async def fetch_one(lid: str) -> None:
+        async with sem:
+            await asyncio.sleep(random.uniform(0.3, 1.0))
+            listing = await fetch_listing_detail_tracked(session, lid, stats, debug_save)
+            if listing:
+                results.append(listing)
+
+    await asyncio.gather(*[fetch_one(lid) for lid in found_ids], return_exceptions=True)
+    logger.info("✅ Получено {} объявлений из поиска", len(results))
+    return results
+
+
+# ─── Probe batch ──────────────────────────────────────────────────────────────
 
 async def probe_batch(
     session: aiohttp.ClientSession,
     n: int = LISTING_PROBE_BATCH,
+    user_filters: Optional[dict] = None,
 ) -> list[Listing]:
-    """
-    Probe *n* listing IDs and return those that have SOFORT KAUFEN.
-
-    All IDs start with "131" followed by 7 random digits:
-      https://www.ricardo.ch/de/a/131xxxxxxx/
-    """
+    """Probe *n* random listing IDs and return those with SOFORT KAUFEN."""
     ids = [
         str(random.randint(LISTING_ID_PREFIX_MIN, LISTING_ID_PREFIX_MAX))
         for _ in range(n)
@@ -826,23 +985,25 @@ async def probe_batch(
     stats: dict = {}
     debug_save: list = []
 
-    logger.info(
-        "🔍 Проверяем %d ID в диапазоне [131xxxxxxx]",
-        n,
-    )
+    logger.info("🔍 Проверяем {} ID в диапазоне [131xxxxxxx]", n)
 
     async def probe_one(lid: str) -> None:
         async with sem:
+            await asyncio.sleep(random.uniform(0.5, 2.0))
             listing = await fetch_listing_detail_tracked(session, lid, stats, debug_save)
             if listing:
-                logger.info("✅ Найдено: [%s] %s (CHF %.0f)",
+                # Apply listing_type filter if provided
+                if user_filters and user_filters.get("listing_type"):
+                    ft = user_filters["listing_type"].lower()
+                    if ft not in ("все", "all", "") and listing.listing_type:
+                        if ft not in listing.listing_type.lower():
+                            return
+                logger.info("✅ Найдено: [{}] {} (CHF {:.0f})",
                             lid, listing.title, listing.price or 0)
                 results.append(listing)
-            await asyncio.sleep(0.2)
 
     await asyncio.gather(*[probe_one(lid) for lid in ids], return_exceptions=True)
 
-    # ── Diagnostic summary ────────────────────────────────────────────────
     parts = []
     total_200 = stats.get("http_200", 0)
     parts.append(f"200: {total_200}")
@@ -860,18 +1021,47 @@ async def probe_batch(
         parts.append(f"json-miss: {stats['json_no_article']}")
     if stats.get("html_no_parse"):
         parts.append(f"html-miss: {stats['html_no_parse']}")
-    other = n - sum(v for k, v in stats.items()
-                    if k.startswith("http_") or k in
-                    ("redirect_dead", "network_err", "no_sofort",
-                     "json_no_article", "html_no_parse"))
-    if other > 0:
-        parts.append(f"other: {other}")
 
-    logger.info(
-        "📊 Батч завершён: %d/%d найдено | %s",
-        len(results), n, ", ".join(parts),
-    )
+    logger.info("📊 Батч завершён: {}/{} найдено | {}", len(results), n, ", ".join(parts))
     return results
+
+
+# ─── Combined search entry point ─────────────────────────────────────────────
+
+async def probe_or_search(
+    session: aiohttp.ClientSession,
+    user_filters: dict,
+    n: int = 50,
+) -> list[Listing]:
+    """
+    Use keyword search if keywords are set, otherwise fall back to probe_batch.
+    Returns a deduplicated list of Listing objects.
+    """
+    keywords = user_filters.get("keywords") or []
+    categories = user_filters.get("categories") or []
+
+    if keywords:
+        results = await search_listings(
+            session,
+            keywords=keywords,
+            categories=categories if categories else None,
+            min_price=user_filters.get("min_price"),
+            max_price=user_filters.get("max_price"),
+            listing_type=user_filters.get("listing_type"),
+            condition=user_filters.get("condition"),
+            n=n,
+        )
+    else:
+        results = await probe_batch(session, n=n, user_filters=user_filters)
+
+    # Deduplicate by listing_id
+    seen_ids: set[str] = set()
+    deduped: list[Listing] = []
+    for lst in results:
+        if lst.listing_id not in seen_ids:
+            seen_ids.add(lst.listing_id)
+            deduped.append(lst)
+    return deduped
 
 
 # ─── Legacy API compat ────────────────────────────────────────────────────────
