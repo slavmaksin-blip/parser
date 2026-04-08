@@ -1,7 +1,7 @@
-"""Async scraper for ricardo.ch listings.
+"""Async scraper for ricardo.ch listings using Playwright (single search approach).
 
-Approach 1 (keyword search): fetch search results page for given keywords.
-Approach 2 (probe fallback): probe random 10-digit listing IDs starting with "131".
+Builds a search URL from user filters, loads the page with a real browser,
+extracts article cards from the DOM, and optionally enriches seller data.
 """
 
 import asyncio
@@ -16,6 +16,13 @@ from typing import Optional, Any
 import aiohttp
 from bs4 import BeautifulSoup
 from loguru import logger
+from playwright.async_api import (
+    async_playwright,
+    BrowserContext,
+    Page,
+    TimeoutError as PWTimeoutError,
+)
+from pydantic import BaseModel
 
 # ─── User-Agent pool ──────────────────────────────────────────────────────────
 _UA_POOL = [
@@ -50,7 +57,7 @@ def _headers() -> dict:
     }
 
 
-# ─── Category definitions ──────────────────────────────────────────────────────
+# ─── Category definitions ─────────────────────────────────────────────────────
 CATEGORIES: dict[str, str] = {
     # Root categories
     "elektronik":  "Elektronik",
@@ -77,17 +84,14 @@ CATEGORIES: dict[str, str] = {
     "garten":      "Garten",
 }
 
-# ─── Probe settings ────────────────────────────────────────────────────────────
-LISTING_ID_PREFIX_MIN = 1_310_000_000
-LISTING_ID_PREFIX_MAX = 1_319_999_999
-LISTING_PROBE_BATCH = 100
-LISTING_PROBE_CONCURRENCY = 10
-
-# German month abbreviations
+# German month names / abbreviations → int
 _DE_MONTHS: dict[str, int] = {
     "jan": 1, "feb": 2, "mär": 3, "mrz": 3, "mar": 3,
     "apr": 4, "mai": 5, "jun": 6, "jul": 7, "aug": 8,
     "sep": 9, "okt": 10, "nov": 11, "dez": 12,
+    "januar": 1, "februar": 2, "märz": 3, "april": 4,
+    "juni": 6, "juli": 7, "august": 8, "september": 9,
+    "oktober": 10, "november": 11, "dezember": 12,
 }
 
 
@@ -203,6 +207,26 @@ class Listing:
         return "\n".join(lines)
 
 
+# ─── Pydantic model ───────────────────────────────────────────────────────────
+
+class RicardoAd(BaseModel):
+    article_id: str
+    title: str
+    price: float
+    currency: str = "CHF"
+    link: str
+    image_urls: list[str] = []
+    creation_date: Optional[datetime] = None
+    seller_username: str = ""
+    seller_registration_date: Optional[datetime] = None
+    seller_sales_count: int = 0
+    seller_rating: Optional[float] = None
+    location: str = ""
+    category: str = ""
+    shipping: Optional[str] = None
+    raw_data: dict = {}
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _ensure_tz(dt: datetime) -> datetime:
@@ -276,7 +300,7 @@ def _try_parse_date(raw: str) -> Optional[datetime]:
     return _parse_german_datetime(raw)
 
 
-# ─── __NEXT_DATA__ helpers ────────────────────────────────────────────────────
+# ─── JSON helpers (used by aiohttp seller enrichment) ────────────────────────
 
 def _extract_next_data(html: str) -> Optional[dict]:
     m = re.search(
@@ -303,360 +327,506 @@ def _deep_get(d: Any, *keys: str) -> Any:
     return d
 
 
-def _find_article(nd: dict) -> Optional[dict]:
-    pp = _deep_get(nd, "props", "pageProps") or {}
-    for key in ("article", "listing", "item", "product", "data", "articleData"):
-        c = pp.get(key)
-        if isinstance(c, dict) and c.get("id"):
-            return c
-    for wrapper in ("initialData", "dehydratedState", "serverData", "initialState"):
-        w = pp.get(wrapper)
-        if isinstance(w, dict):
-            for inner in ("article", "listing", "item"):
-                c = w.get(inner)
-                if isinstance(c, dict) and c.get("id"):
-                    return c
-            for q in (w.get("queries") or []):
-                state = _deep_get(q, "state", "data")
-                if isinstance(state, dict) and state.get("id"):
-                    return state
-    return None
+# ─── Browser state ────────────────────────────────────────────────────────────
+
+_playwright_instance: Any = None
+_browser: Any = None
+_browser_context: Optional[BrowserContext] = None
+_consecutive_errors: int = 0
 
 
-def _extract_price_from_article(article: dict) -> Optional[float]:
-    for key in (
-        "buyNowPrice", "sofortKaufPreis", "sofortpreis", "fixedPrice",
-        "currentPrice", "price", "buyItNowPrice",
-    ):
-        raw = article.get(key)
-        if isinstance(raw, (int, float)) and raw > 0:
-            return float(raw)
-        if isinstance(raw, dict):
-            for ak in ("amount", "value", "chf", "price", "centAmount"):
-                v = raw.get(ak)
-                if isinstance(v, (int, float)) and v > 0:
-                    return float(v) / 100 if ak == "centAmount" else float(v)
-        if isinstance(raw, str) and raw.strip():
-            p = _parse_price(raw)
-            if p:
-                return p
+async def init_browser() -> BrowserContext:
+    """Initialize (or re-initialize) a headless Chromium browser context."""
+    global _playwright_instance, _browser, _browser_context
+    for obj, method in [
+        (_browser_context, "close"),
+        (_browser, "close"),
+        (_playwright_instance, "stop"),
+    ]:
+        if obj is not None:
+            try:
+                await getattr(obj, method)()
+            except Exception:
+                pass
+    _browser_context = None
+    _browser = None
+    _playwright_instance = None
 
-    prices = article.get("prices")
-    if isinstance(prices, list):
-        for p_obj in prices:
-            if isinstance(p_obj, dict):
-                t = (p_obj.get("type") or "").lower()
-                if "buy" in t or "sofort" in t or "fixed" in t or "now" in t:
-                    for ak in ("amount", "value", "price"):
-                        v = p_obj.get(ak)
-                        if isinstance(v, (int, float)) and v > 0:
-                            return float(v)
-    if isinstance(prices, dict):
-        for k, v in prices.items():
-            if isinstance(v, (int, float)) and v > 0:
-                return float(v)
-    return None
+    _playwright_instance = await async_playwright().start()
+    _browser = await _playwright_instance.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+    _browser_context = await _browser.new_context(
+        user_agent=_random_ua(),
+        locale="de-CH",
+        viewport={"width": 1280, "height": 800},
+        extra_http_headers={"Accept-Language": "de-CH,de;q=0.9,en;q=0.8"},
+    )
+    logger.info("🌐 Playwright браузер инициализирован")
+    return _browser_context
 
 
-def _is_sofort_kaufen_article(article: dict) -> bool:
-    for key in ("type", "listingType", "articleType", "saleType", "sellingType"):
-        val = str(article.get(key) or "").lower()
-        if val and any(k in val for k in ("buy_now", "buynow", "sofort", "fixed")):
+async def close_browser() -> None:
+    """Shut down the Playwright browser and release resources."""
+    global _playwright_instance, _browser, _browser_context
+    for obj, method in [
+        (_browser_context, "close"),
+        (_browser, "close"),
+        (_playwright_instance, "stop"),
+    ]:
+        if obj is not None:
+            try:
+                await getattr(obj, method)()
+            except Exception:
+                pass
+    _browser_context = None
+    _browser = None
+    _playwright_instance = None
+    logger.info("🌐 Playwright браузер закрыт")
+
+
+async def _ensure_browser() -> BrowserContext:
+    """Return the existing BrowserContext, initializing one if needed."""
+    global _browser_context
+    if _browser_context is None:
+        await init_browser()
+    return _browser_context  # type: ignore[return-value]
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+def rotate_user_agent() -> str:
+    """Return a random User-Agent string."""
+    return _random_ua()
+
+
+async def random_delay(min_sec: float = 8, max_sec: float = 25) -> None:
+    """Sleep for a random duration to reduce bot-detection risk."""
+    await asyncio.sleep(random.uniform(min_sec, max_sec))
+
+
+async def take_screenshot_on_error(page: Page, step_name: str) -> None:
+    """Save a debug screenshot to /tmp on error."""
+    try:
+        path = f"/tmp/error_{step_name}_{int(datetime.now().timestamp())}.png"
+        await page.screenshot(path=path, full_page=False)
+        logger.debug("📸 Screenshot saved: {}", path)
+    except Exception as exc:
+        logger.debug("Screenshot failed ({}): {}", step_name, exc)
+
+
+# ─── Step 1: URL builder ──────────────────────────────────────────────────────
+
+def build_search_url(filters: dict) -> str:
+    """Build a Ricardo.ch search URL from a user filter dict.
+
+    Examples::
+
+        https://www.ricardo.ch/de/s/iphone?sort=newest&priceFrom=200&priceTo=550
+        https://www.ricardo.ch/de/s/?sort=newest&priceFrom=150
+        https://www.ricardo.ch/de/s/iPhone%2014?sort=newest&shipping=Abholung
+    """
+    keywords: list[str] = filters.get("keywords") or []
+    min_price = filters.get("min_price")
+    max_price = filters.get("max_price")
+    listing_type: str = filters.get("listing_type") or ""
+    condition: str = filters.get("condition") or ""
+    delivery: str = filters.get("delivery") or ""
+
+    if keywords:
+        kw = " ".join(keywords)
+        base = f"https://www.ricardo.ch/de/s/{urllib.parse.quote(kw)}"
+    else:
+        base = "https://www.ricardo.ch/de/s/"
+
+    params: dict[str, str] = {"sort": "newest"}
+
+    if min_price:
+        params["priceFrom"] = str(int(min_price))
+    if max_price:
+        params["priceTo"] = str(int(max_price))
+
+    if listing_type and listing_type.lower() not in ("все", "all", ""):
+        lt_map = {
+            "sofortkauf": "buy_now",
+            "auktion": "auction",
+            "festpreis": "fixed_price",
+        }
+        params["saleType"] = lt_map.get(listing_type.lower(), listing_type)
+
+    if condition and condition.lower() not in ("alle", "all", "все", ""):
+        params["condition"] = condition
+
+    if delivery and delivery.lower() not in ("beides", "all", "все", ""):
+        if "abholung" in delivery.lower():
+            params["shipping"] = "Abholung"
+        elif "versand" in delivery.lower():
+            params["shipping"] = "Versand"
+
+    return f"{base}?{urllib.parse.urlencode(params)}"
+
+
+# ─── Step 2: safe_goto ────────────────────────────────────────────────────────
+
+async def safe_goto(page: Page, url: str, retries: int = 3) -> bool:
+    """Navigate to *url* with automatic retry on failure.
+
+    Returns True on success, False if all retries are exhausted.
+    """
+    for attempt in range(retries):
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=45_000)
             return True
-    return _extract_price_from_article(article) is not None
+        except Exception as exc:
+            logger.warning(
+                "safe_goto attempt {}/{} for {}: {}",
+                attempt + 1, retries, url, exc,
+            )
+            await take_screenshot_on_error(page, f"goto_fail_{attempt + 1}")
+            if attempt < retries - 1:
+                await asyncio.sleep(5 * (attempt + 1))
+    return False
 
 
-def _listing_from_next_data(nd: dict, listing_id: str, url: str) -> Optional[Listing]:
-    article = _find_article(nd)
-    if not article:
-        return None
-    if not _is_sofort_kaufen_article(article):
-        return None
+# ─── Step 2: load_search_page ────────────────────────────────────────────────
 
-    price = _extract_price_from_article(article)
+async def load_search_page(page: Page, url: str) -> None:
+    """Load the Ricardo.ch search results page and scroll to reveal all cards."""
+    success = await safe_goto(page, url)
+    if not success:
+        await take_screenshot_on_error(page, "load_search_failed")
+        raise RuntimeError(f"Failed to load search page after retries: {url}")
 
-    title: Optional[str] = None
-    for key in ("title", "name", "articleTitle", "subject", "itemTitle"):
-        t = article.get(key)
-        if isinstance(t, str) and t.strip():
-            title = t.strip()
-            break
-    if not title:
-        return None
+    try:
+        await page.wait_for_selector(
+            '[data-testid="article-card"], .article-card',
+            timeout=15_000,
+        )
+    except Exception as exc:
+        await take_screenshot_on_error(page, "no_article_cards")
+        raise RuntimeError(f"Article cards not found on {url}: {exc}")
 
-    posted_at: Optional[datetime] = None
-    for key in ("endDate", "startDate", "createdAt", "publishedAt",
-                "insertionDate", "activationDate", "expiryDate"):
-        raw = article.get(key)
-        if raw:
-            posted_at = _try_parse_date(str(raw))
-            if posted_at:
-                break
-
-    end_date: Optional[datetime] = None
-    for key in ("endDate", "auctionEndDate", "expiryDate"):
-        raw = article.get(key)
-        if raw:
-            end_date = _try_parse_date(str(raw))
-            if end_date:
-                break
-
-    seller_name = ""
-    seller_url = ""
-    seller_rating: Optional[float] = None
-    for sk in ("seller", "vendor", "user", "article_seller"):
-        s = article.get(sk)
-        if isinstance(s, dict):
-            for nk in ("nickname", "username", "name", "login", "shopName", "userId"):
-                n = s.get(nk)
-                if isinstance(n, str) and n.strip():
-                    seller_name = n.strip()
-                    break
-            for rk in ("rating", "sellerRating", "score"):
-                rv = s.get(rk)
-                if isinstance(rv, (int, float)):
-                    seller_rating = float(rv)
-                    break
-        if seller_name:
-            break
-    if seller_name:
-        seller_url = f"https://www.ricardo.ch/de/shop/{seller_name}/ratings/"
-
-    image_url = ""
-    for ik in ("images", "photos", "gallery"):
-        imgs = article.get(ik)
-        if isinstance(imgs, list) and imgs:
-            first = imgs[0]
-            if isinstance(first, str) and first.startswith("http"):
-                image_url = first
-            elif isinstance(first, dict):
-                for uk in ("url", "src", "original", "large", "medium"):
-                    v = first.get(uk)
-                    if isinstance(v, str) and v.startswith("http"):
-                        image_url = v
-                        break
-            break
-    if not image_url:
-        for ik in ("imageUrl", "thumbnailUrl", "image", "photo"):
-            v = article.get(ik)
-            if isinstance(v, str) and v.startswith("http"):
-                image_url = v
-                break
-
-    # listing_type
-    listing_type = ""
-    for key in ("type", "listingType", "articleType", "saleType", "sellingType"):
-        raw = str(article.get(key) or "").lower()
-        if "sofort" in raw or "buy_now" in raw or "buynow" in raw or "fixed" in raw:
-            listing_type = "Sofortkauf"
-            break
-        elif "auction" in raw or "auktion" in raw or "bieten" in raw:
-            listing_type = "Auktion"
-            break
-        elif "festpreis" in raw or "fixed_price" in raw:
-            listing_type = "Festpreis"
-            break
-
-    # condition
-    condition = ""
-    for key in ("condition", "itemCondition", "articleCondition", "zustand"):
-        raw = str(article.get(key) or "")
-        if raw.strip():
-            condition = raw.strip()
-            break
-
-    # location
-    location = ""
-    for key in ("location", "city", "zip", "address", "region"):
-        raw = article.get(key)
-        if isinstance(raw, str) and raw.strip():
-            location = raw.strip()
-            break
-        elif isinstance(raw, dict):
-            city = raw.get("city") or raw.get("zip") or ""
-            if city:
-                location = str(city)
-                break
-
-    # delivery
-    delivery = ""
-    for key in ("delivery", "deliveryOptions", "shipping", "versand"):
-        raw = article.get(key)
-        if isinstance(raw, str) and raw.strip():
-            delivery = raw.strip()
-            break
-
-    # category
-    category = ""
-    for key in ("category", "categoryName", "mainCategory"):
-        raw = article.get(key)
-        if isinstance(raw, str) and raw.strip():
-            category = raw.strip()
-            break
-        elif isinstance(raw, dict):
-            for ck in ("name", "label", "title"):
-                cv = raw.get(ck)
-                if isinstance(cv, str) and cv.strip():
-                    category = cv.strip()
-                    break
-
-    return Listing(
-        listing_id=listing_id,
-        title=title,
-        price=price,
-        url=url,
-        image_url=image_url,
-        posted_at=posted_at,
-        seller_name=seller_name,
-        seller_url=seller_url,
-        seller_rating=seller_rating,
-        listing_type=listing_type,
-        condition=condition,
-        location=location,
-        delivery=delivery,
-        category=category,
-        end_date=end_date,
-    )
+    # Scroll down 2–3 times to trigger lazy-loading of all cards on the first page
+    for _ in range(3):
+        await page.evaluate("window.scrollBy(0, window.innerHeight * 1.5)")
+        await asyncio.sleep(0.8)
 
 
-# ─── HTML fallback for individual listing pages ───────────────────────────────
+# ─── Step 3: extract_cards ───────────────────────────────────────────────────
 
-def _listing_from_html(html: str, listing_id: str, url: str) -> Optional[Listing]:
-    has_sofort = bool(re.search(r"sofort.{0,2}kauf", html, re.I))
-    if not has_sofort:
-        return None
+async def extract_cards(page: Page) -> list[dict]:
+    """Extract raw article card data from the current search results page."""
+    cards: list[dict] = []
+    try:
+        card_elements = await page.query_selector_all(
+            '[data-testid="article-card"], .article-card'
+        )
+    except Exception as exc:
+        logger.error("extract_cards query failed: {}", exc)
+        return cards
 
-    soup = BeautifulSoup(html, "lxml")
+    for card_el in card_elements:
+        try:
+            raw: dict = {}
 
-    title: Optional[str] = None
-    h1 = soup.find("h1")
-    if h1:
-        title = h1.get_text(strip=True)
-    if not title:
-        for cand in [
-            soup.find(attrs={"data-testid": re.compile(r"title|name|heading", re.I)}),
-            soup.find(class_=re.compile(r"title|heading|article.name|product.name", re.I)),
-        ]:
-            if cand:
-                t = cand.get_text(strip=True)
-                if t and len(t) > 3:
-                    title = t
-                    break
-    if not title:
-        return None
-
-    posted_at: Optional[datetime] = None
-    for node in soup.find_all(string=re.compile(r"\d{1,2}\.\s+\w+\.?\s+\d{4}", re.I)):
-        dt = _parse_german_datetime(str(node))
-        if dt:
-            posted_at = dt
-            break
-    if not posted_at:
-        for t_tag in soup.find_all("time"):
-            da = t_tag.get("datetime") or t_tag.get_text(strip=True)
-            if da:
-                dt = _try_parse_date(da)
-                if dt:
-                    posted_at = dt
-                    break
-
-    price: Optional[float] = None
-    for label_text in (
-        "Sofort-Kaufpreis", "sofortkaufpreis", "Sofort Kaufpreis",
-        "Sofort-Kauf", "Buy Now Price",
-    ):
-        label = soup.find(string=re.compile(re.escape(label_text), re.I))
-        if label:
-            container = label.find_parent()
-            if container:
-                search_nodes = list(container.next_siblings) + [container.parent]
-                for node in search_nodes:
-                    if not (node and hasattr(node, "get_text")):
-                        continue
-                    p = _parse_price(node.get_text(" ", strip=True))
-                    if p:
-                        price = p
-                        break
-            if price:
-                break
-
-    if price is None:
-        for tag in soup.find_all(class_=re.compile(r"price|preis|kaufpreis", re.I)):
-            candidate = tag.get_text(" ", strip=True)
-            if re.search(r"start|auction|gebot|bieten", candidate, re.I):
+            # article_id
+            article_id = await card_el.get_attribute("data-article-id") or ""
+            if not article_id:
+                link_el = await card_el.query_selector("a[href*='/de/a/']")
+                if link_el:
+                    href = await link_el.get_attribute("href") or ""
+                    m = re.search(r"/de/a/(\d{6,12})", href)
+                    if m:
+                        article_id = m.group(1)
+            if not article_id:
                 continue
-            p = _parse_price(candidate)
-            if p:
-                price = p
-                break
+            raw["article_id"] = article_id
 
-    seller_name = ""
-    seller_url = ""
-    vk_node = soup.find(string=re.compile(r"Verk[äa]ufer", re.I))
-    if vk_node:
-        container = vk_node.find_parent()
-        for _ in range(3):
-            if container is None:
-                break
-            lnk = container.find("a", href=re.compile(r"/de/shop/"))
-            if lnk:
-                m = re.search(r"/de/shop/([^/]+)/", lnk.get("href", ""))
-                if m:
-                    seller_name = m.group(1)
+            # title
+            for sel in (
+                '[data-testid="article-title"]',
+                ".article-title",
+                "h2",
+                "h3",
+            ):
+                el = await card_el.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        raw["title"] = text
+                        break
+
+            # price
+            for sel in ('[data-testid="price"]', ".price"):
+                el = await card_el.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    raw["price_text"] = text
+                    p = _parse_price(text)
+                    if p:
+                        raw["price"] = p
                     break
-            container = container.parent
 
-    if not seller_name:
-        for lnk in soup.find_all("a", href=re.compile(r"/de/shop/")):
-            m = re.search(r"/de/shop/([^/]+)/", lnk.get("href", ""))
+            # seller
+            for sel in ('[data-testid="seller-name"]', ".seller-name"):
+                el = await card_el.query_selector(sel)
+                if el:
+                    raw["seller_username"] = (await el.inner_text()).strip()
+                    break
+
+            # location
+            for sel in ('[data-testid="location"]', ".location"):
+                el = await card_el.query_selector(sel)
+                if el:
+                    raw["location"] = (await el.inner_text()).strip()
+                    break
+
+            # time_ago
+            for sel in ('[data-testid="time-ago"]', ".time-ago", "time"):
+                el = await card_el.query_selector(sel)
+                if el:
+                    raw["time_ago"] = (await el.inner_text()).strip()
+                    break
+
+            # link
+            link_el = await card_el.query_selector("a.article-link, a[href*='/de/a/']")
+            if link_el:
+                href = (await link_el.get_attribute("href")) or ""
+                raw["link"] = (
+                    href if href.startswith("http")
+                    else f"https://www.ricardo.ch{href}"
+                )
+
+            # image
+            img_el = await card_el.query_selector("img")
+            if img_el:
+                src = (
+                    await img_el.get_attribute("src")
+                    or await img_el.get_attribute("data-src")
+                    or ""
+                )
+                if src:
+                    raw["image_url"] = src
+
+            cards.append(raw)
+        except Exception as exc:
+            logger.debug("Error extracting single card: {}", exc)
+            continue
+
+    return cards
+
+
+# ─── Step 4: parse_full_ad ───────────────────────────────────────────────────
+
+async def parse_full_ad(page: Page, ad_url: str) -> dict:
+    """Fetch a full listing page and extract extended fields (images, description, etc.)."""
+    result: dict = {"url": ad_url}
+    await safe_goto(page, ad_url)
+    try:
+        await page.wait_for_selector('[data-testid="article-detail"]', timeout=10_000)
+    except Exception:
+        pass  # Continue and extract whatever is available
+
+    # Description
+    try:
+        el = await page.query_selector('[data-testid="description"]')
+        if el:
+            result["description"] = (await el.inner_text()).strip()
+    except Exception:
+        pass
+
+    # Gallery images
+    try:
+        imgs = await page.query_selector_all('img[data-testid="gallery-image"]')
+        srcs = [await img.get_attribute("src") for img in imgs]
+        result["image_urls"] = [s for s in srcs if s]
+        if not result["image_urls"]:
+            all_imgs = await page.query_selector_all("img")
+            urls = []
+            for img in all_imgs:
+                src = await img.get_attribute("src") or ""
+                if src and re.search(r"cdn|media|img|photo", src, re.I):
+                    urls.append(src)
+            result["image_urls"] = urls
+    except Exception:
+        result["image_urls"] = []
+
+    # Views count
+    try:
+        el = await page.query_selector('[data-testid="views-count"], .views-count')
+        if el:
+            m = re.search(r"\d+", await el.inner_text())
             if m:
-                seller_name = m.group(1)
-                break
+                result["views_count"] = int(m.group())
+    except Exception:
+        pass
 
-    if seller_name:
-        seller_url = f"https://www.ricardo.ch/de/shop/{seller_name}/ratings/"
+    # Bids / purchases count
+    try:
+        el = await page.query_selector('[data-testid="bids-count"], .bids-count')
+        if el:
+            m = re.search(r"\d+", await el.inner_text())
+            if m:
+                result["bids_count"] = int(m.group())
+    except Exception:
+        pass
 
-    image_url = ""
-    for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or ""
-        if src.startswith("http") and re.search(r"ricardo|cdn|media|img", src, re.I):
-            image_url = src
-            break
+    # Exact publication date
+    try:
+        el = await page.query_selector('[data-testid="creation-date"], time')
+        if el:
+            dt_attr = await el.get_attribute("datetime") or ""
+            dt_text = (await el.inner_text()).strip()
+            result["creation_date"] = _try_parse_date(dt_attr or dt_text)
+    except Exception:
+        pass
 
-    # location
-    location = ""
-    page_text = soup.get_text(" ", strip=True)
-    m_loc = re.search(r"Standort[:\s]+([A-Za-zÀ-ÿ\s\-]+\d{4})", page_text)
-    if m_loc:
-        location = m_loc.group(1).strip()
+    return result
 
-    # condition
-    condition = ""
-    m_cond = re.search(r"Zustand[:\s]+(Neu|Gebraucht|Wie neu|Defekt)", page_text, re.I)
-    if m_cond:
-        condition = m_cond.group(1).strip()
 
-    return Listing(
-        listing_id=listing_id,
-        title=title,
-        price=price,
-        url=url,
-        image_url=image_url,
-        posted_at=posted_at,
-        seller_name=seller_name,
-        seller_url=seller_url,
-        listing_type="Sofortkauf",
-        condition=condition,
-        location=location,
+# ─── Step 5: parse_seller_profile ────────────────────────────────────────────
+
+async def parse_seller_profile(page: Page, username: str) -> dict:
+    """Fetch the seller profile at /de/u/{username} and extract registration/sales data."""
+    url = f"https://www.ricardo.ch/de/u/{username}"
+    result: dict = {"username": username}
+
+    success = await safe_goto(page, url)
+    if not success:
+        return result
+
+    try:
+        await page.wait_for_selector(
+            '[data-testid="user-profile"], .user-profile, .profile-header',
+            timeout=8_000,
+        )
+    except Exception:
+        pass
+
+    try:
+        page_text = await page.inner_text("body")
+    except Exception:
+        return result
+
+    # registration_date: "Mitglied seit März 2022"
+    m = re.search(
+        r"Mitglied\s+seit\s+([\w.]+\.?\s*\d{4}|\d{2}\.\d{2}\.\d{4}|\d{4})",
+        page_text, re.I,
     )
+    if m:
+        raw = m.group(1).strip()
+        year_m = re.search(r"\d{4}", raw)
+        if year_m:
+            year = int(year_m.group())
+            month_raw = re.sub(r"[\d.\s]", "", raw).strip().lower().rstrip(".")
+            month = _DE_MONTHS.get(month_raw) or _DE_MONTHS.get(month_raw[:3], 1)
+            try:
+                result["registration_date"] = datetime(year, month, 1, tzinfo=timezone.utc)
+            except ValueError:
+                result["registration_date"] = datetime(year, 1, 1, tzinfo=timezone.utc)
+
+    # sales_count: "142 Verkäufe"
+    m = re.search(r"(\d[\d'.]*)\s+Verk[äa]ufe", page_text, re.I)
+    if m:
+        try:
+            result["sales_count"] = int(re.sub(r"['\s.]", "", m.group(1)))
+        except ValueError:
+            pass
+
+    # positive_feedback: "98 % positiv"
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*%\s*positiv", page_text, re.I)
+    if m:
+        try:
+            result["positive_feedback"] = float(m.group(1).replace(",", "."))
+        except ValueError:
+            pass
+
+    return result
 
 
-# ─── Seller profile ───────────────────────────────────────────────────────────
+# ─── Step 8: scrape_new_ads ───────────────────────────────────────────────────
+
+async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
+    """Main scraping entry point using Playwright.
+
+    Builds a search URL, loads the page, extracts article cards, and returns
+    new Listing objects for IDs not in *seen_ids*.
+    Browser errors are retried; after 5 consecutive failures the browser restarts.
+    """
+    global _consecutive_errors
+
+    ctx = await _ensure_browser()
+    page = await ctx.new_page()
+    try:
+        url = build_search_url(filters)
+        logger.info("🔍 Поиск: {}", url)
+
+        try:
+            await load_search_page(page, url)
+        except RuntimeError as exc:
+            logger.error("load_search_page: {}", exc)
+            _consecutive_errors += 1
+            if _consecutive_errors >= 5:
+                logger.warning("≥5 ошибок подряд — перезапускаем браузер")
+                await init_browser()
+                _consecutive_errors = 0
+            return []
+
+        cards = await extract_cards(page)
+        logger.info("📋 Карточек на странице: {}", len(cards))
+
+    except Exception as exc:
+        logger.error("scrape_new_ads error: {}", exc)
+        _consecutive_errors += 1
+        if _consecutive_errors >= 5:
+            logger.warning("≥5 ошибок подряд — перезапускаем браузер")
+            await init_browser()
+            _consecutive_errors = 0
+        return []
+    finally:
+        await page.close()
+
+    new_listings: list[Listing] = []
+    for card in cards:
+        article_id = card.get("article_id", "")
+        if not article_id or article_id in seen_ids:
+            continue
+        if not card.get("title"):
+            continue
+        link = card.get("link") or f"https://www.ricardo.ch/de/a/{article_id}/"
+        seller_name = card.get("seller_username") or ""
+        listing = Listing(
+            listing_id=article_id,
+            title=card["title"],
+            price=card.get("price"),
+            url=link,
+            image_url=card.get("image_url") or "",
+            seller_name=seller_name,
+            seller_url=(
+                f"https://www.ricardo.ch/de/shop/{seller_name}/ratings/"
+                if seller_name else ""
+            ),
+            location=card.get("location") or "",
+        )
+        new_listings.append(listing)
+
+    _consecutive_errors = 0
+    logger.info("✅ Новых объявлений: {}", len(new_listings))
+    return new_listings
+
+
+# ─── Seller enrichment (aiohttp, lightweight) ────────────────────────────────
 
 async def fetch_seller_info(
     session: aiohttp.ClientSession,
     seller_url: str,
 ) -> tuple[Optional[datetime], Optional[int], Optional[int]]:
+    """Fetch seller registration date, sold count, and purchases count via aiohttp."""
     if not seller_url:
         return None, None, None
     ratings_url = (
@@ -674,7 +844,7 @@ async def fetch_seller_info(
                 return None, None, None
             html = await resp.text()
     except Exception as exc:
-        logger.debug("Seller profile fetch error ({}): {}", ratings_url, exc)
+        logger.debug("fetch_seller_info error ({}): {}", ratings_url, exc)
         return None, None, None
 
     reg_date: Optional[datetime] = None
@@ -694,9 +864,9 @@ async def fetch_seller_info(
                 if raw:
                     reg_date = _try_parse_date(str(raw))
                     if not reg_date:
-                        m = re.search(r"\b(20\d{2}|19\d{2})\b", str(raw))
-                        if m:
-                            reg_date = datetime(int(m.group(1)), 1, 1, tzinfo=timezone.utc)
+                        mx = re.search(r"\b(20\d{2}|19\d{2})\b", str(raw))
+                        if mx:
+                            reg_date = datetime(int(mx.group(1)), 1, 1, tzinfo=timezone.utc)
                     if reg_date:
                         break
             for sk in ("soldCount", "salesCount", "numberOfSales", "sellerRatingCount"):
@@ -716,9 +886,9 @@ async def fetch_seller_info(
     page_text = soup.get_text(" ", strip=True)
 
     if not reg_date:
-        m = re.search(r"Mitglied\s+seit\s+(\d{2}\.\d{2}\.(\d{4})|\d{4})", page_text, re.I)
-        if m:
-            full = m.group(1)
+        mx = re.search(r"Mitglied\s+seit\s+(\d{2}\.\d{2}\.(\d{4})|\d{4})", page_text, re.I)
+        if mx:
+            full = mx.group(1)
             if "." in full:
                 parts = full.split(".")
                 try:
@@ -730,346 +900,66 @@ async def fetch_seller_info(
                 reg_date = datetime(int(full), 1, 1, tzinfo=timezone.utc)
 
     if not reg_date:
-        m = re.search(r"seit\s+(20\d{2}|19\d{2})\b", page_text, re.I)
-        if m:
-            reg_date = datetime(int(m.group(1)), 1, 1, tzinfo=timezone.utc)
+        mx = re.search(r"seit\s+(20\d{2}|19\d{2})\b", page_text, re.I)
+        if mx:
+            reg_date = datetime(int(mx.group(1)), 1, 1, tzinfo=timezone.utc)
 
     if sold_count is None:
-        m = re.search(r"als?\s+Verk[äa]ufer[^\d]*(\d[\d'.\s]*)", page_text, re.I)
-        if m:
+        mx = re.search(r"als?\s+Verk[äa]ufer[^\d]*(\d[\d'.\s]*)", page_text, re.I)
+        if mx:
             try:
-                sold_count = int(re.sub(r"['\s.]", "", m.group(1)))
+                sold_count = int(re.sub(r"['\s.]", "", mx.group(1)))
             except ValueError:
                 pass
 
     if purchases_count is None:
-        m = re.search(r"als?\s+K[äa]ufer[^\d]*(\d[\d'.\s]*)", page_text, re.I)
-        if m:
+        mx = re.search(r"als?\s+K[äa]ufer[^\d]*(\d[\d'.\s]*)", page_text, re.I)
+        if mx:
             try:
-                purchases_count = int(re.sub(r"['\s.]", "", m.group(1)))
+                purchases_count = int(re.sub(r"['\s.]", "", mx.group(1)))
             except ValueError:
                 pass
 
     return reg_date, sold_count, purchases_count
 
 
-# ─── Individual listing fetch ─────────────────────────────────────────────────
-
-async def fetch_listing_detail(
-    session: aiohttp.ClientSession,
-    listing_id: str,
-) -> Optional[Listing]:
-    url = f"https://www.ricardo.ch/de/a/{listing_id}/"
-    try:
-        async with session.get(
-            url,
-            headers=_headers(),
-            timeout=aiohttp.ClientTimeout(total=15),
-            allow_redirects=True,
-        ) as resp:
-            if resp.status != 200:
-                return None
-            final_url = str(resp.url)
-            if "/a/" not in final_url and "ricardo" in final_url:
-                return None
-            html = await resp.text()
-    except Exception as exc:
-        logger.debug("fetch_listing_detail({}) network error: {}", listing_id, exc)
-        return None
-
-    nd = _extract_next_data(html)
-    if nd:
-        listing = _listing_from_next_data(nd, listing_id, url)
-        if listing:
-            return listing
-
-    return _listing_from_html(html, listing_id, url)
-
-
-async def fetch_listing_detail_tracked(
-    session: aiohttp.ClientSession,
-    listing_id: str,
-    stats: dict,
-    debug_save: list,
-) -> Optional[Listing]:
-    url = f"https://www.ricardo.ch/de/a/{listing_id}/"
-    html = None
-    try:
-        async with session.get(
-            url,
-            headers=_headers(),
-            timeout=aiohttp.ClientTimeout(total=15),
-            allow_redirects=True,
-        ) as resp:
-            code = resp.status
-            if code != 200:
-                stats[f"http_{code}"] = stats.get(f"http_{code}", 0) + 1
-                return None
-            final_url = str(resp.url)
-            if "/a/" not in final_url and "ricardo" in final_url:
-                stats["redirect_dead"] = stats.get("redirect_dead", 0) + 1
-                return None
-            html = await resp.text()
-    except Exception as exc:
-        stats["network_err"] = stats.get("network_err", 0) + 1
-        logger.debug("probe({}) error: {}", listing_id, exc)
-        return None
-
-    stats["http_200"] = stats.get("http_200", 0) + 1
-
-    has_sofort = bool(re.search(r"sofort.{0,2}kauf", html, re.I))
-    if not has_sofort:
-        stats["no_sofort"] = stats.get("no_sofort", 0) + 1
-        return None
-
-    nd = _extract_next_data(html)
-    if nd:
-        listing = _listing_from_next_data(nd, listing_id, url)
-        if listing:
-            return listing
-        stats["json_no_article"] = stats.get("json_no_article", 0) + 1
-
-    listing = _listing_from_html(html, listing_id, url)
-    if not listing:
-        stats["html_no_parse"] = stats.get("html_no_parse", 0) + 1
-    return listing
-
-
-# ─── Seller enrichment ────────────────────────────────────────────────────────
-
 async def enrich_seller_info(
     session: aiohttp.ClientSession,
-    listings: list[Listing],
+    listings: list["Listing"],
 ) -> None:
+    """Enrich listings with seller registration date and sales count (aiohttp)."""
     tasks = [_enrich_one(session, lst) for lst in listings if lst.seller_url]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _enrich_one(session: aiohttp.ClientSession, listing: Listing) -> None:
+async def _enrich_one(session: aiohttp.ClientSession, listing: "Listing") -> None:
     reg, sold, purchases = await fetch_seller_info(session, listing.seller_url)
     listing.seller_registered = reg
     listing.sold_count = sold
     listing.purchases_count = purchases
 
 
-# ─── Keyword search ───────────────────────────────────────────────────────────
-
-async def search_listings(
-    session: aiohttp.ClientSession,
-    keywords: list[str],
-    categories: list[str] | None = None,
-    min_price: Optional[float] = None,
-    max_price: Optional[float] = None,
-    listing_type: Optional[str] = None,
-    condition: Optional[str] = None,
-    n: int = 20,
-) -> list[Listing]:
-    """Search Ricardo.ch by keywords and return found listings."""
-    if not keywords:
-        return []
-
-    keyword_str = " ".join(keywords)
-    encoded = urllib.parse.quote(keyword_str)
-    url = f"https://www.ricardo.ch/de/s/{encoded}/?sort=newest"
-    if min_price is not None:
-        url += f"&priceFrom={int(min_price)}"
-    if max_price is not None:
-        url += f"&priceTo={int(max_price)}"
-
-    logger.info("🔍 Поиск по ключевым словам: {} → {}", keyword_str, url)
-
-    try:
-        async with session.get(
-            url,
-            headers=_headers(),
-            timeout=aiohttp.ClientTimeout(total=20),
-            allow_redirects=True,
-        ) as resp:
-            if resp.status != 200:
-                logger.warning("Search page returned HTTP {}", resp.status)
-                return []
-            html = await resp.text()
-    except Exception as exc:
-        logger.error("search_listings network error: {}", exc)
-        return []
-
-    # Extract listing IDs from links
-    found_ids: list[str] = []
-    # Try to extract from __NEXT_DATA__ first
-    nd = _extract_next_data(html)
-    if nd:
-        try:
-            pp = _deep_get(nd, "props", "pageProps") or {}
-            for key in ("articles", "listings", "items", "results", "data"):
-                items = pp.get(key)
-                if isinstance(items, list):
-                    for item in items:
-                        if isinstance(item, dict):
-                            lid = str(item.get("id") or item.get("articleId") or "")
-                            if lid.isdigit() and lid not in found_ids:
-                                found_ids.append(lid)
-                    if found_ids:
-                        break
-            # Try dehydratedState
-            if not found_ids:
-                dstate = pp.get("dehydratedState") or {}
-                for q in (dstate.get("queries") or []):
-                    data = _deep_get(q, "state", "data")
-                    if isinstance(data, dict):
-                        for key in ("articles", "listings", "items", "results"):
-                            items = data.get(key)
-                            if isinstance(items, list):
-                                for item in items:
-                                    if isinstance(item, dict):
-                                        lid = str(item.get("id") or item.get("articleId") or "")
-                                        if lid.isdigit() and lid not in found_ids:
-                                            found_ids.append(lid)
-        except Exception as exc:
-            logger.debug("search_listings JSON parse error: {}", exc)
-
-    # Fallback: extract IDs from HTML links
-    if not found_ids:
-        for m in re.finditer(r'/de/a/(\d{8,12})/', html):
-            lid = m.group(1)
-            if lid not in found_ids:
-                found_ids.append(lid)
-
-    if not found_ids:
-        # Try article-card data-testid patterns in HTML
-        soup = BeautifulSoup(html, "lxml")
-        for card in soup.find_all(attrs={"data-testid": re.compile(r"article-card", re.I)}):
-            lnk = card.find("a", href=re.compile(r"/de/a/\d+"))
-            if lnk:
-                m = re.search(r"/de/a/(\d+)/", lnk.get("href", ""))
-                if m and m.group(1) not in found_ids:
-                    found_ids.append(m.group(1))
-
-    logger.info("🔗 Найдено {} ID объявлений в поиске", len(found_ids))
-
-    # Fetch detail pages for found IDs (up to n)
-    found_ids = found_ids[:n]
-    results: list[Listing] = []
-    stats: dict = {}
-    debug_save: list = []
-
-    sem = asyncio.Semaphore(5)
-
-    async def fetch_one(lid: str) -> None:
-        async with sem:
-            await asyncio.sleep(random.uniform(0.5, 2.0))
-            listing = await fetch_listing_detail_tracked(session, lid, stats, debug_save)
-            if listing:
-                results.append(listing)
-
-    await asyncio.gather(*[fetch_one(lid) for lid in found_ids], return_exceptions=True)
-    logger.info("✅ Получено {} объявлений из поиска", len(results))
-    return results
-
-
-# ─── Probe batch ──────────────────────────────────────────────────────────────
-
-async def probe_batch(
-    session: aiohttp.ClientSession,
-    n: int = LISTING_PROBE_BATCH,
-    user_filters: Optional[dict] = None,
-) -> list[Listing]:
-    """Probe *n* random listing IDs and return those with SOFORT KAUFEN."""
-    ids = [
-        str(random.randint(LISTING_ID_PREFIX_MIN, LISTING_ID_PREFIX_MAX))
-        for _ in range(n)
-    ]
-
-    sem = asyncio.Semaphore(LISTING_PROBE_CONCURRENCY)
-    results: list[Listing] = []
-    stats: dict = {}
-    debug_save: list = []
-
-    logger.info("🔍 Проверяем {} ID в диапазоне [131xxxxxxx]", n)
-
-    async def probe_one(lid: str) -> None:
-        async with sem:
-            await asyncio.sleep(random.uniform(0.5, 2.0))
-            listing = await fetch_listing_detail_tracked(session, lid, stats, debug_save)
-            if listing:
-                # Apply listing_type filter if provided
-                if user_filters and user_filters.get("listing_type"):
-                    ft = user_filters["listing_type"].lower()
-                    if ft not in ("все", "all", "") and listing.listing_type:
-                        if ft not in listing.listing_type.lower():
-                            return
-                logger.info("✅ Найдено: [{}] {} (CHF {:.0f})",
-                            lid, listing.title, listing.price or 0)
-                results.append(listing)
-
-    await asyncio.gather(*[probe_one(lid) for lid in ids], return_exceptions=True)
-
-    parts = []
-    total_200 = stats.get("http_200", 0)
-    parts.append(f"200: {total_200}")
-    for code in (404, 403, 301, 302):
-        v = stats.get(f"http_{code}", 0)
-        if v:
-            parts.append(f"{code}: {v}")
-    if stats.get("redirect_dead"):
-        parts.append(f"redirect: {stats['redirect_dead']}")
-    if stats.get("network_err"):
-        parts.append(f"err: {stats['network_err']}")
-    if stats.get("no_sofort"):
-        parts.append(f"no-sofort: {stats['no_sofort']}")
-    if stats.get("json_no_article"):
-        parts.append(f"json-miss: {stats['json_no_article']}")
-    if stats.get("html_no_parse"):
-        parts.append(f"html-miss: {stats['html_no_parse']}")
-
-    logger.info("📊 Батч завершён: {}/{} найдено | {}", len(results), n, ", ".join(parts))
-    return results
-
-
-# ─── Combined search entry point ─────────────────────────────────────────────
+# ─── Main entry point (backward-compat wrapper) ───────────────────────────────
 
 async def probe_or_search(
     session: aiohttp.ClientSession,
     user_filters: dict,
     n: int = 50,
-) -> list[Listing]:
-    """
-    Use keyword search if keywords are set, otherwise fall back to probe_batch.
-    Returns a deduplicated list of Listing objects.
-    """
-    keywords = user_filters.get("keywords") or []
-    categories = user_filters.get("categories") or []
+) -> list["Listing"]:
+    """Search for listings using Playwright and return up to *n* results.
 
-    if keywords:
-        results = await search_listings(
-            session,
-            keywords=keywords,
-            categories=categories if categories else None,
-            min_price=user_filters.get("min_price"),
-            max_price=user_filters.get("max_price"),
-            listing_type=user_filters.get("listing_type"),
-            condition=user_filters.get("condition"),
-            n=n,
-        )
-    else:
-        results = await probe_batch(session, n=n, user_filters=user_filters)
+    The *session* parameter is kept for API compatibility with bot.py;
+    it is passed to ``enrich_seller_info`` for fast seller data fetching.
+    """
+    results = await scrape_new_ads(user_filters, seen_ids=set())
 
     # Deduplicate by listing_id
-    seen_ids: set[str] = set()
+    seen: set[str] = set()
     deduped: list[Listing] = []
     for lst in results:
-        if lst.listing_id not in seen_ids:
-            seen_ids.add(lst.listing_id)
+        if lst.listing_id not in seen:
+            seen.add(lst.listing_id)
             deduped.append(lst)
-    return deduped
+    return deduped[:n]
 
-
-# ─── Legacy API compat ────────────────────────────────────────────────────────
-
-async def fetch_listings(
-    session: aiohttp.ClientSession,
-    keywords: list[str],
-    categories: list[str],
-) -> list[Listing]:
-    """Legacy wrapper – kept for backward compatibility."""
-    return await probe_batch(session)
