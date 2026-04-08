@@ -526,27 +526,27 @@ class CloudflareBlockError(RuntimeError):
 
 
 async def _is_cloudflare_blocked(page: Page) -> bool:
-    """Return True if the current page is a Cloudflare bot-challenge page."""
+    """Return True if the current page is a Cloudflare bot-challenge page.
+
+    Only matches genuine Cloudflare challenge/CAPTCHA pages, NOT normal pages
+    that happen to load Cloudflare CDN scripts (which would be a false positive).
+    """
     try:
         title = (await page.title()).lower()
-        if "just a moment" in title or "attention required" in title:
+        # Cloudflare challenge pages have well-known titles
+        if "just a moment" in title or "attention required" in title or "one more step" in title:
             return True
-        # Check for Cloudflare challenge elements / markers in page content
+        # Only match highly specific DOM elements that exist exclusively on
+        # Cloudflare challenge pages (not on pages that merely use CF for CDN).
         for selector in (
             "#challenge-form",
             "#cf-please-wait",
             ".cf-browser-verification",
-            "[data-translate='why_captcha_headline']",
             "input[name='cf-turnstile-response']",
+            "#turnstile-wrapper",
         ):
             if await page.query_selector(selector):
                 return True
-        content = await page.content()
-        if "cloudflare" in content.lower() and (
-            "challenge" in content.lower() or "turnstile" in content.lower()
-            or "cf-chl" in content.lower()
-        ):
-            return True
     except Exception:
         pass
     return False
