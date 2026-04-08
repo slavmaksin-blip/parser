@@ -6,6 +6,7 @@ extracts article cards from the DOM, and optionally enriches seller data.
 
 import asyncio
 import json
+import os
 import random
 import re
 import urllib.parse
@@ -333,6 +334,7 @@ _playwright_instance: Any = None
 _browser: Any = None
 _browser_context: Optional[BrowserContext] = None
 _consecutive_errors: int = 0
+MAX_CONSECUTIVE_ERRORS: int = 5  # restart browser after this many consecutive failures
 
 
 async def init_browser() -> BrowserContext:
@@ -411,9 +413,13 @@ async def random_delay(min_sec: float = 8, max_sec: float = 25) -> None:
 
 
 async def take_screenshot_on_error(page: Page, step_name: str) -> None:
-    """Save a debug screenshot to /tmp on error."""
+    """Save a debug screenshot to a temporary directory on error."""
     try:
-        path = f"/tmp/error_{step_name}_{int(datetime.now().timestamp())}.png"
+        import tempfile
+        path = os.path.join(
+            tempfile.gettempdir(),
+            f"error_{step_name}_{int(datetime.now().timestamp())}.png",
+        )
         await page.screenshot(path=path, full_page=False)
         logger.debug("📸 Screenshot saved: {}", path)
     except Exception as exc:
@@ -540,6 +546,7 @@ async def extract_cards(page: Page) -> list[dict]:
                 link_el = await card_el.query_selector("a[href*='/de/a/']")
                 if link_el:
                     href = await link_el.get_attribute("href") or ""
+                    # Ricardo article IDs are typically 8–10 digit numbers
                     m = re.search(r"/de/a/(\d{6,12})", href)
                     if m:
                         article_id = m.group(1)
@@ -771,8 +778,8 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
         except RuntimeError as exc:
             logger.error("load_search_page: {}", exc)
             _consecutive_errors += 1
-            if _consecutive_errors >= 5:
-                logger.warning("≥5 ошибок подряд — перезапускаем браузер")
+            if _consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                logger.warning("≥%d ошибок подряд — перезапускаем браузер", MAX_CONSECUTIVE_ERRORS)
                 await init_browser()
                 _consecutive_errors = 0
             return []
@@ -783,8 +790,8 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
     except Exception as exc:
         logger.error("scrape_new_ads error: {}", exc)
         _consecutive_errors += 1
-        if _consecutive_errors >= 5:
-            logger.warning("≥5 ошибок подряд — перезапускаем браузер")
+        if _consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            logger.warning("≥%d ошибок подряд — перезапускаем браузер", MAX_CONSECUTIVE_ERRORS)
             await init_browser()
             _consecutive_errors = 0
         return []
