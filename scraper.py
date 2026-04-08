@@ -404,6 +404,7 @@ _browser: Any = None
 _browser_context: Optional[BrowserContext] = None
 _consecutive_errors: int = 0
 MAX_CONSECUTIVE_ERRORS: int = 5  # restart browser after this many consecutive failures
+CLOUDFLARE_BLOCK_SLEEP_SECONDS: int = 300  # 5-minute pause after a Cloudflare block
 
 
 async def init_browser() -> BrowserContext:
@@ -928,11 +929,11 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
         try:
             await load_search_page(page, url)
         except CloudflareBlockError as exc:
-            logger.warning("🛡️ Cloudflare block: {} — пауза 5 мин + рестарт браузера", exc)
+            logger.warning("🛡️ Cloudflare block: {} — пауза {} сек + рестарт браузера", exc, CLOUDFLARE_BLOCK_SLEEP_SECONDS)
             _consecutive_errors = 0
             await page.close()
             await init_browser()
-            await asyncio.sleep(300)  # 5-minute mandatory pause
+            await asyncio.sleep(CLOUDFLARE_BLOCK_SLEEP_SECONDS)
             return []
         except RuntimeError as exc:
             logger.error("load_search_page: {}", exc)
@@ -947,10 +948,10 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
         logger.info("📋 Карточек на странице: {}", len(cards))
 
     except CloudflareBlockError as exc:
-        logger.warning("🛡️ Cloudflare block (outer): {} — пауза 5 мин", exc)
+        logger.warning("🛡️ Cloudflare block (outer): {} — пауза {} сек", exc, CLOUDFLARE_BLOCK_SLEEP_SECONDS)
         _consecutive_errors = 0
         await init_browser()
-        await asyncio.sleep(300)
+        await asyncio.sleep(CLOUDFLARE_BLOCK_SLEEP_SECONDS)
         return []
     except Exception as exc:
         logger.error("scrape_new_ads error: {}", exc)
