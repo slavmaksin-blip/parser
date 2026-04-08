@@ -5,6 +5,7 @@ import os
 import random
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -748,7 +749,7 @@ async def main() -> None:
     active_users = await db.get_active_users()
     logger.info("Восстанавливаем {} активных пользователей", len(active_users))
 
-    bot = Bot(token=TOKEN, parse_mode="HTML")
+    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
