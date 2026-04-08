@@ -957,7 +957,7 @@ async def search_listings(
 
     async def fetch_one(lid: str) -> None:
         async with sem:
-            await asyncio.sleep(random.uniform(0.3, 1.0))
+            await asyncio.sleep(random.uniform(0.5, 2.0))
             listing = await fetch_listing_detail_tracked(session, lid, stats, debug_save)
             if listing:
                 results.append(listing)

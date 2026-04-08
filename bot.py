@@ -29,6 +29,9 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 router = Router()
 
+# ─── Constants ────────────────────────────────────────────────────────────────
+MAX_LISTINGS_PER_CYCLE = 5   # max new listings sent per monitoring cycle
+
 # ─── FSM States ───────────────────────────────────────────────────────────────
 
 class FilterStates(StatesGroup):
@@ -221,7 +224,7 @@ async def _search_loop(user_id: int, chat_id: int, bot: Bot) -> None:
                     for listing in listings:
                         if not await db.is_active(user_id):
                             return
-                        if sent >= 5:
+                        if sent >= MAX_LISTINGS_PER_CYCLE:
                             break
                         if await db.is_seen(user_id, listing.listing_id):
                             continue
@@ -756,13 +759,6 @@ async def main() -> None:
         hours=24,
     )
     scheduler.start()
-
-    # We can't restore tasks before bot object exists, so we'll do it via
-    # a startup hook after dp starts
-    async def on_startup() -> None:
-        for uid in active_users:
-            # We don't have chat_id stored, skip until user sends a message
-            pass
 
     logger.info("Бот запущен. Polling...")
     await dp.start_polling(bot)
