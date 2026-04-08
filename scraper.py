@@ -47,6 +47,75 @@ except Exception:
     def _random_ua() -> str:
         return random.choice(_UA_POOL)
 
+# Optional: playwright-stealth for stronger fingerprint masking
+try:
+    from playwright_stealth import stealth_async as _stealth_async  # type: ignore
+    _HAS_PLAYWRIGHT_STEALTH = True
+except ImportError:
+    _HAS_PLAYWRIGHT_STEALTH = False
+
+
+# ─── Stealth JS injected into every page via context.add_init_script() ────────
+# Removes the most common Playwright/CDP automation signals that Cloudflare
+# and other bot-detection systems check for.
+_STEALTH_JS = """
+(function () {
+    // 1. Remove navigator.webdriver
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+    // 2. Spoof window.chrome to look like a real Chrome install
+    window.chrome = window.chrome || {};
+    window.chrome.runtime = window.chrome.runtime || {};
+    window.chrome.app = window.chrome.app || {};
+
+    // 3. Fix navigator.languages
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['de-CH', 'de', 'en-US', 'en']
+    });
+
+    // 4. Fake non-empty plugin list (headless Chrome has no plugins)
+    const fakePlugin = (name, desc, fn) => {
+        return {name, description: desc, filename: fn, length: 1,
+                item: (i) => null, namedItem: (n) => null, [Symbol.iterator]: function*() {}};
+    };
+    const fakePlugins = [
+        fakePlugin('PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'),
+        fakePlugin('Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'),
+        fakePlugin('Chromium PDF Viewer', 'Portable Document Format', 'mhjfbmdgcfjbbpaeojofohoefgiehjai'),
+    ];
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => Object.assign(fakePlugins, {length: fakePlugins.length,
+            item: (i) => fakePlugins[i] || null,
+            namedItem: (n) => fakePlugins.find(p => p.name === n) || null,
+            [Symbol.iterator]: function*() { yield* fakePlugins; }
+        })
+    });
+
+    // 5. Fix permissions.query for notifications (headless returns 'denied' which is a signal)
+    if (navigator.permissions && navigator.permissions.query) {
+        const _origQuery = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = (params) => {
+            if (params && params.name === 'notifications') {
+                return Promise.resolve({state: 'default', onchange: null});
+            }
+            return _origQuery(params);
+        };
+    }
+
+    // 6. Realistic connection info
+    try {
+        Object.defineProperty(navigator, 'connection', {
+            get: () => ({effectiveType: '4g', rtt: 50, downlink: 10,
+                         saveData: false, type: 'wifi', onchange: null})
+        });
+    } catch (_) {}
+
+    // 7. Remove Playwright-specific properties from Error stacks
+    const _origError = Error;
+    window.Error = class extends _origError {};
+})();
+"""
+
 
 def _headers() -> dict:
     return {
@@ -338,7 +407,7 @@ MAX_CONSECUTIVE_ERRORS: int = 5  # restart browser after this many consecutive f
 
 
 async def init_browser() -> BrowserContext:
-    """Initialize (or re-initialize) a headless Chromium browser context."""
+    """Initialize (or re-initialize) a hardened headless Chromium browser context."""
     global _playwright_instance, _browser, _browser_context
     for obj, method in [
         (_browser_context, "close"),
@@ -360,16 +429,39 @@ async def init_browser() -> BrowserContext:
         args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
+            # Hide automation signals
             "--disable-blink-features=AutomationControlled",
+            "--disable-automation",
+            "--disable-infobars",
+            # Realistic features
+            "--enable-javascript",
+            "--disable-popup-blocking",
+            # Reduce fingerprinting surface
+            "--disable-web-security",
+            "--allow-running-insecure-content",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--window-size=1280,800",
         ],
     )
     _browser_context = await _browser.new_context(
         user_agent=_random_ua(),
         locale="de-CH",
+        timezone_id="Europe/Zurich",
         viewport={"width": 1280, "height": 800},
-        extra_http_headers={"Accept-Language": "de-CH,de;q=0.9,en;q=0.8"},
+        screen={"width": 1280, "height": 800},
+        color_scheme="light",
+        extra_http_headers={
+            "Accept-Language": "de-CH,de;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "sec-ch-ua-platform": '"Windows"',
+        },
+        java_script_enabled=True,
+        # Disable webdriver flag at context level
+        bypass_csp=False,
     )
-    logger.info("🌐 Playwright браузер инициализирован")
+    # Inject stealth JS into every page before any scripts run
+    await _browser_context.add_init_script(script=_STEALTH_JS)
+    logger.info("🌐 Playwright браузер инициализирован (stealth={})", _HAS_PLAYWRIGHT_STEALTH)
     return _browser_context
 
 
@@ -424,6 +516,39 @@ async def take_screenshot_on_error(page: Page, step_name: str) -> None:
         logger.debug("📸 Screenshot saved: {}", path)
     except Exception as exc:
         logger.debug("Screenshot failed ({}): {}", step_name, exc)
+
+
+# ─── Cloudflare detection ─────────────────────────────────────────────────────
+
+class CloudflareBlockError(RuntimeError):
+    """Raised when a Cloudflare challenge page is detected."""
+
+
+async def _is_cloudflare_blocked(page: Page) -> bool:
+    """Return True if the current page is a Cloudflare bot-challenge page."""
+    try:
+        title = (await page.title()).lower()
+        if "just a moment" in title or "attention required" in title:
+            return True
+        # Check for Cloudflare challenge elements / markers in page content
+        for selector in (
+            "#challenge-form",
+            "#cf-please-wait",
+            ".cf-browser-verification",
+            "[data-translate='why_captcha_headline']",
+            "input[name='cf-turnstile-response']",
+        ):
+            if await page.query_selector(selector):
+                return True
+        content = await page.content()
+        if "cloudflare" in content.lower() and (
+            "challenge" in content.lower() or "turnstile" in content.lower()
+            or "cf-chl" in content.lower()
+        ):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ─── Step 1: URL builder ──────────────────────────────────────────────────────
@@ -483,7 +608,15 @@ async def safe_goto(page: Page, url: str, retries: int = 3) -> bool:
     """Navigate to *url* with automatic retry on failure.
 
     Returns True on success, False if all retries are exhausted.
+    Applies playwright-stealth per-page if the library is available.
     """
+    # Apply per-page stealth patch (on top of the context-level init_script)
+    if _HAS_PLAYWRIGHT_STEALTH:
+        try:
+            await _stealth_async(page)
+        except Exception:
+            pass
+
     for attempt in range(retries):
         try:
             await page.goto(url, wait_until="networkidle", timeout=45_000)
@@ -502,11 +635,22 @@ async def safe_goto(page: Page, url: str, retries: int = 3) -> bool:
 # ─── Step 2: load_search_page ────────────────────────────────────────────────
 
 async def load_search_page(page: Page, url: str) -> None:
-    """Load the Ricardo.ch search results page and scroll to reveal all cards."""
+    """Load the Ricardo.ch search results page and scroll to reveal all cards.
+
+    Raises CloudflareBlockError if a Cloudflare challenge is detected so that
+    the caller can sleep and restart the browser.
+    """
     success = await safe_goto(page, url)
     if not success:
         await take_screenshot_on_error(page, "load_search_failed")
         raise RuntimeError(f"Failed to load search page after retries: {url}")
+
+    # Detect Cloudflare block before waiting for article cards
+    if await _is_cloudflare_blocked(page):
+        await take_screenshot_on_error(page, "cloudflare_block")
+        raise CloudflareBlockError(
+            f"Cloudflare challenge detected on {url} — bot-detection triggered"
+        )
 
     try:
         await page.wait_for_selector(
@@ -514,6 +658,12 @@ async def load_search_page(page: Page, url: str) -> None:
             timeout=15_000,
         )
     except Exception as exc:
+        # One last Cloudflare check — the challenge can appear after networkidle
+        if await _is_cloudflare_blocked(page):
+            await take_screenshot_on_error(page, "cloudflare_block_late")
+            raise CloudflareBlockError(
+                f"Cloudflare challenge appeared after page load on {url}"
+            )
         await take_screenshot_on_error(page, "no_article_cards")
         raise RuntimeError(f"Article cards not found on {url}: {exc}")
 
@@ -763,7 +913,9 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
 
     Builds a search URL, loads the page, extracts article cards, and returns
     new Listing objects for IDs not in *seen_ids*.
-    Browser errors are retried; after 5 consecutive failures the browser restarts.
+
+    Cloudflare challenges trigger a 5-minute sleep and full browser restart.
+    Other errors are counted; after MAX_CONSECUTIVE_ERRORS the browser restarts.
     """
     global _consecutive_errors
 
@@ -775,6 +927,13 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
 
         try:
             await load_search_page(page, url)
+        except CloudflareBlockError as exc:
+            logger.warning("🛡️ Cloudflare block: {} — пауза 5 мин + рестарт браузера", exc)
+            _consecutive_errors = 0
+            await page.close()
+            await init_browser()
+            await asyncio.sleep(300)  # 5-minute mandatory pause
+            return []
         except RuntimeError as exc:
             logger.error("load_search_page: {}", exc)
             _consecutive_errors += 1
@@ -787,6 +946,12 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
         cards = await extract_cards(page)
         logger.info("📋 Карточек на странице: {}", len(cards))
 
+    except CloudflareBlockError as exc:
+        logger.warning("🛡️ Cloudflare block (outer): {} — пауза 5 мин", exc)
+        _consecutive_errors = 0
+        await init_browser()
+        await asyncio.sleep(300)
+        return []
     except Exception as exc:
         logger.error("scrape_new_ads error: {}", exc)
         _consecutive_errors += 1
@@ -796,7 +961,10 @@ async def scrape_new_ads(filters: dict, seen_ids: set) -> list["Listing"]:
             _consecutive_errors = 0
         return []
     finally:
-        await page.close()
+        try:
+            await page.close()
+        except Exception:
+            pass
 
     new_listings: list[Listing] = []
     for card in cards:

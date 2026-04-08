@@ -6,6 +6,7 @@ beautifulsoup4==4.12.3
 fake-useragent==1.5.1
 loguru==0.7.2
 lxml==5.2.1
+playwright==1.44.0
+playwright-stealth==1.0.6
 pydantic==2.7.1
 python-dotenv==1.0.1
-playwright==1.44.0
