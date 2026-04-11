@@ -3,6 +3,7 @@
 import asyncio
 import os
 import random
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -43,6 +44,11 @@ class FilterStates(StatesGroup):
     ST_MAX_PRICE = State()
     ST_SELLER_DATE = State()
     ST_MIN_SOLD = State()
+    ST_MAX_SOLD = State()
+    ST_MIN_PURCHASES = State()
+    ST_MAX_PURCHASES = State()
+    ST_LISTING_DATE_FROM = State()
+    ST_LISTING_DATE_TO = State()
     ST_LISTING_TYPE = State()
     ST_CONDITION = State()
     ST_LOCATION = State()
@@ -79,6 +85,11 @@ def _filter_menu_keyboard(buf: dict) -> InlineKeyboardMarkup:
     max_p = buf.get("max_price")
     seller_date = buf.get("max_seller_reg_date")
     min_sold = buf.get("min_sold")
+    max_sold = buf.get("max_sold")
+    min_purchases = buf.get("min_purchases")
+    max_purchases = buf.get("max_purchases")
+    listing_date_from = buf.get("listing_date_from")
+    listing_date_to = buf.get("listing_date_to")
     listing_type = buf.get("listing_type")
     condition = buf.get("condition")
     location = buf.get("location")
@@ -101,11 +112,26 @@ def _filter_menu_keyboard(buf: dict) -> InlineKeyboardMarkup:
             text=f"💰 Цена до ({max_p if max_p is not None else '—'} CHF)",
             callback_data="edit_max_price")],
         [InlineKeyboardButton(
-            text=f"📅 Продавец зарег. до ({seller_date or '—'})",
+            text=f"📅 Дата публ. от ({listing_date_from or '—'})",
+            callback_data="edit_listing_date_from")],
+        [InlineKeyboardButton(
+            text=f"📅 Дата публ. до ({listing_date_to or '—'})",
+            callback_data="edit_listing_date_to")],
+        [InlineKeyboardButton(
+            text=f"🗓 Продавец зарег. до ({seller_date or '—'})",
             callback_data="edit_seller_date")],
         [InlineKeyboardButton(
-            text=f"📦 Продано мин. ({min_sold if min_sold is not None else '—'})",
-            callback_data="edit_min_sold")],
+            text=f"📦 Продаж мин. ({min_sold if min_sold is not None else '—'})",
+            callback_data="edit_min_sold"),
+         InlineKeyboardButton(
+            text=f"📦 Продаж макс. ({max_sold if max_sold is not None else '—'})",
+            callback_data="edit_max_sold")],
+        [InlineKeyboardButton(
+            text=f"🛒 Покупок мин. ({min_purchases if min_purchases is not None else '—'})",
+            callback_data="edit_min_purchases"),
+         InlineKeyboardButton(
+            text=f"🛒 Покупок макс. ({max_purchases if max_purchases is not None else '—'})",
+            callback_data="edit_max_purchases")],
         [InlineKeyboardButton(
             text=f"🏷 Тип лота ({listing_type or 'Все'})",
             callback_data="edit_listing_type")],
@@ -187,9 +213,16 @@ def _filter_summary(f: dict) -> str:
         f"📂 <b>Категории:</b> {', '.join(cats) if cats else '—'}",
         f"💰 <b>Цена от:</b> {f['min_price']} CHF" if f.get("min_price") else "💰 <b>Цена от:</b> —",
         f"💰 <b>Цена до:</b> {f['max_price']} CHF" if f.get("max_price") else "💰 <b>Цена до:</b> —",
-        f"📅 <b>Продавец зарег. до:</b> {f['max_seller_reg_date']}"
-            if f.get("max_seller_reg_date") else "📅 <b>Продавец зарег. до:</b> —",
-        f"📦 <b>Продано мин.:</b> {f['min_sold']}" if f.get("min_sold") else "📦 <b>Продано мин.:</b> —",
+        f"📅 <b>Дата публ. от:</b> {f['listing_date_from']}"
+            if f.get("listing_date_from") else "📅 <b>Дата публ. от:</b> —",
+        f"📅 <b>Дата публ. до:</b> {f['listing_date_to']}"
+            if f.get("listing_date_to") else "📅 <b>Дата публ. до:</b> —",
+        f"🗓 <b>Продавец зарег. до:</b> {f['max_seller_reg_date']}"
+            if f.get("max_seller_reg_date") else "🗓 <b>Продавец зарег. до:</b> —",
+        f"📦 <b>Продаж от:</b> {f['min_sold']}" if f.get("min_sold") else "📦 <b>Продаж от:</b> —",
+        f"📦 <b>Продаж до:</b> {f['max_sold']}" if f.get("max_sold") else "📦 <b>Продаж до:</b> —",
+        f"🛒 <b>Покупок от:</b> {f['min_purchases']}" if f.get("min_purchases") else "🛒 <b>Покупок от:</b> —",
+        f"🛒 <b>Покупок до:</b> {f['max_purchases']}" if f.get("max_purchases") else "🛒 <b>Покупок до:</b> —",
         f"🏷 <b>Тип лота:</b> {f['listing_type']}" if f.get("listing_type") else "🏷 <b>Тип лота:</b> Все",
         f"🔧 <b>Состояние:</b> {f['condition']}" if f.get("condition") else "🔧 <b>Состояние:</b> Все",
         f"📍 <b>Локация:</b> {f['location']}" if f.get("location") else "📍 <b>Локация:</b> —",
@@ -468,6 +501,62 @@ async def cb_edit_min_sold(call: CallbackQuery, state: FSMContext) -> None:
     )
 
 
+@router.callback_query(F.data == "edit_max_sold")
+async def cb_edit_max_sold(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(FilterStates.ST_MAX_SOLD)
+    await call.message.answer(
+        "📦 <b>Максимум продаж у продавца</b>\n\nВведи число (или 0 для отключения):",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "edit_min_purchases")
+async def cb_edit_min_purchases(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(FilterStates.ST_MIN_PURCHASES)
+    await call.message.answer(
+        "🛒 <b>Минимум покупок у продавца</b>\n\nВведи число (или 0 для отключения):",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "edit_max_purchases")
+async def cb_edit_max_purchases(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(FilterStates.ST_MAX_PURCHASES)
+    await call.message.answer(
+        "🛒 <b>Максимум покупок у продавца</b>\n\nВведи число (или 0 для отключения):",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "edit_listing_date_from")
+async def cb_edit_listing_date_from(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(FilterStates.ST_LISTING_DATE_FROM)
+    await call.message.answer(
+        "📅 <b>Дата публикации — от</b>\n\n"
+        "Показывать объявления, опубликованные <b>после</b> этой даты.\n"
+        "Формат: <code>ГГГГ-ММ-ДД</code> или <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>\n"
+        "Или <code>-</code> для отключения:",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "edit_listing_date_to")
+async def cb_edit_listing_date_to(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(FilterStates.ST_LISTING_DATE_TO)
+    await call.message.answer(
+        "📅 <b>Дата публикации — до</b>\n\n"
+        "Показывать объявления, опубликованные <b>до</b> этой даты.\n"
+        "Формат: <code>ГГГГ-ММ-ДД</code> или <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>\n"
+        "Или <code>-</code> для отключения:",
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data == "edit_listing_type")
 async def cb_edit_listing_type(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
@@ -702,6 +791,103 @@ async def fsm_min_sold(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Неверный формат. Введи целое число, например <code>10</code>.",
                              parse_mode="HTML")
         return
+    await state.update_data(buf=buf)
+    await _show_filter_menu(message, state)
+
+
+@router.message(FilterStates.ST_MAX_SOLD)
+async def fsm_max_sold(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    data = await state.get_data()
+    buf = data.get("buf", {})
+    try:
+        val = int(text)
+        buf["max_sold"] = None if val <= 0 else val
+    except ValueError:
+        await message.answer("⚠️ Неверный формат. Введи целое число, например <code>100</code>.",
+                             parse_mode="HTML")
+        return
+    await state.update_data(buf=buf)
+    await _show_filter_menu(message, state)
+
+
+@router.message(FilterStates.ST_MIN_PURCHASES)
+async def fsm_min_purchases(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    data = await state.get_data()
+    buf = data.get("buf", {})
+    try:
+        val = int(text)
+        buf["min_purchases"] = None if val <= 0 else val
+    except ValueError:
+        await message.answer("⚠️ Неверный формат. Введи целое число, например <code>5</code>.",
+                             parse_mode="HTML")
+        return
+    await state.update_data(buf=buf)
+    await _show_filter_menu(message, state)
+
+
+@router.message(FilterStates.ST_MAX_PURCHASES)
+async def fsm_max_purchases(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    data = await state.get_data()
+    buf = data.get("buf", {})
+    try:
+        val = int(text)
+        buf["max_purchases"] = None if val <= 0 else val
+    except ValueError:
+        await message.answer("⚠️ Неверный формат. Введи целое число, например <code>50</code>.",
+                             parse_mode="HTML")
+        return
+    await state.update_data(buf=buf)
+    await _show_filter_menu(message, state)
+
+
+def _parse_date_input(text: str) -> Optional[str]:
+    """Parse a date input (YYYY-MM-DD or YYYY-MM-DD HH:MM) and return ISO string or None."""
+    import re as _re
+    text = text.strip()
+    if text in ("-", "0", ""):
+        return None
+    # YYYY-MM-DD HH:MM
+    if _re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", text):
+        return text.replace(" ", "T") + ":00"
+    # YYYY-MM-DD
+    if _re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        return text
+    return None
+
+
+@router.message(FilterStates.ST_LISTING_DATE_FROM)
+async def fsm_listing_date_from(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    data = await state.get_data()
+    buf = data.get("buf", {})
+    parsed = _parse_date_input(text)
+    if text not in ("-", "0", "") and parsed is None:
+        await message.answer(
+            "⚠️ Неверный формат. Используй <code>ГГГГ-ММ-ДД</code> или <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>.",
+            parse_mode="HTML",
+        )
+        return
+    buf["listing_date_from"] = parsed
+    await state.update_data(buf=buf)
+    await _show_filter_menu(message, state)
+
+
+@router.message(FilterStates.ST_LISTING_DATE_TO)
+async def fsm_listing_date_to(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    data = await state.get_data()
+    buf = data.get("buf", {})
+    parsed = _parse_date_input(text)
+    if text not in ("-", "0", "") and parsed is None:
+        await message.answer(
+            "⚠️ Неверный формат. Используй <code>ГГГГ-ММ-ДД</code> или <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>.",
+            parse_mode="HTML",
+        )
+        return
+    buf["listing_date_to"] = parsed
     await state.update_data(buf=buf)
     await _show_filter_menu(message, state)
 

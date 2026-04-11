@@ -197,6 +197,11 @@ class Listing:
         max_p = filters.get("max_price")
         seller_reg_before = filters.get("max_seller_reg_date")
         min_sold = filters.get("min_sold")
+        max_sold = filters.get("max_sold")
+        min_purchases = filters.get("min_purchases")
+        max_purchases = filters.get("max_purchases")
+        listing_date_from = filters.get("listing_date_from")
+        listing_date_to = filters.get("listing_date_to")
         f_listing_type = filters.get("listing_type")
         f_condition = filters.get("condition")
         f_location = filters.get("location")
@@ -216,6 +221,29 @@ class Listing:
 
         if min_sold is not None and self.sold_count is not None and self.sold_count < min_sold:
             return False
+        if max_sold is not None and self.sold_count is not None and self.sold_count > max_sold:
+            return False
+
+        if min_purchases is not None and self.purchases_count is not None and self.purchases_count < min_purchases:
+            return False
+        if max_purchases is not None and self.purchases_count is not None and self.purchases_count > max_purchases:
+            return False
+
+        if listing_date_from and self.posted_at:
+            try:
+                from_dt = _ensure_tz(datetime.fromisoformat(listing_date_from))
+                if _ensure_tz(self.posted_at) < from_dt:
+                    return False
+            except (ValueError, AttributeError):
+                pass
+
+        if listing_date_to and self.posted_at:
+            try:
+                to_dt = _ensure_tz(datetime.fromisoformat(listing_date_to))
+                if _ensure_tz(self.posted_at) > to_dt:
+                    return False
+            except (ValueError, AttributeError):
+                pass
 
         if f_listing_type and f_listing_type.lower() not in ("все", "all", ""):
             if self.listing_type and f_listing_type.lower() not in self.listing_type.lower():
@@ -250,7 +278,7 @@ class Listing:
             else "Неизвестно"
         )
         reg_str = (
-            self.seller_registered.strftime("%Y")
+            self.seller_registered.strftime("%d.%m.%Y")
             if self.seller_registered
             else "Неизвестно"
         )
@@ -269,9 +297,12 @@ class Listing:
         lines.append(f"📅 Опубликовано: {posted_str}")
         if self.end_date:
             lines.append(f"⏰ Окончание: {self.end_date.strftime('%d.%m.%Y %H:%M')}")
-        lines.append(f"👤 Продавец: <b>{self.seller_name or 'Неизвестно'}</b> (с {reg_str})")
+        lines.append(f"👤 Продавец: <b>{self.seller_name or 'Неизвестно'}</b>")
+        lines.append(f"📆 Зарег.: {reg_str}")
         if self.sold_count is not None:
-            lines.append(f"📦 Продано: {self.sold_count}")
+            lines.append(f"📦 Продаж: {self.sold_count}")
+        if self.purchases_count is not None:
+            lines.append(f"🛒 Покупок: {self.purchases_count}")
         if self.seller_rating is not None:
             lines.append(f"⭐ Рейтинг: {self.seller_rating:.1f}")
         return "\n".join(lines)

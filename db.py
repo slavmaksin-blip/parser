@@ -23,6 +23,11 @@ CREATE TABLE IF NOT EXISTS filters (
     max_price           REAL    DEFAULT NULL,
     max_seller_reg_date TEXT    DEFAULT NULL,
     min_sold            INTEGER DEFAULT NULL,
+    max_sold            INTEGER DEFAULT NULL,
+    min_purchases       INTEGER DEFAULT NULL,
+    max_purchases       INTEGER DEFAULT NULL,
+    listing_date_from   TEXT    DEFAULT NULL,
+    listing_date_to     TEXT    DEFAULT NULL,
     listing_type        TEXT    DEFAULT NULL,
     condition           TEXT    DEFAULT NULL,
     location            TEXT    DEFAULT NULL,
@@ -43,6 +48,11 @@ CREATE TABLE IF NOT EXISTS seen_listings (
 # Columns added in later migrations (column_name, sql_type, default_expr)
 _MIGRATION_COLUMNS = [
     ("min_sold",            "INTEGER", "NULL"),
+    ("max_sold",            "INTEGER", "NULL"),
+    ("min_purchases",       "INTEGER", "NULL"),
+    ("max_purchases",       "INTEGER", "NULL"),
+    ("listing_date_from",   "TEXT",    "NULL"),
+    ("listing_date_to",     "TEXT",    "NULL"),
     ("listing_type",        "TEXT",    "NULL"),
     ("condition",           "TEXT",    "NULL"),
     ("location",            "TEXT",    "NULL"),
@@ -53,9 +63,6 @@ _MIGRATION_COLUMNS = [
 # don't exist or can't be dropped in SQLite.
 _OBSOLETE_COLUMNS = [
     "max_listing_age_h",
-    "listing_date_from",
-    "listing_date_to",
-    "min_purchases",
 ]
 
 
@@ -125,6 +132,11 @@ async def save_filters(user_id: int, data: dict) -> None:
                 max_price           = ?,
                 max_seller_reg_date = ?,
                 min_sold            = ?,
+                max_sold            = ?,
+                min_purchases       = ?,
+                max_purchases       = ?,
+                listing_date_from   = ?,
+                listing_date_to     = ?,
                 listing_type        = ?,
                 condition           = ?,
                 location            = ?,
@@ -138,6 +150,11 @@ async def save_filters(user_id: int, data: dict) -> None:
                 data.get("max_price"),
                 data.get("max_seller_reg_date"),
                 data.get("min_sold"),
+                data.get("max_sold"),
+                data.get("min_purchases"),
+                data.get("max_purchases"),
+                data.get("listing_date_from"),
+                data.get("listing_date_to"),
                 data.get("listing_type"),
                 data.get("condition"),
                 data.get("location"),
